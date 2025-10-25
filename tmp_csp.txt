@@ -11,7 +11,7 @@ from utils.SafeMul import SafeInnerProduct
 
 
 class CSP:
-    """中心服务器（CSP）"""
+    """中心服务器（CSP�?""
 
     def __init__(self, ta, model_size: int = 5, precision: int = 10 ** 6):
         self.ta = ta
@@ -23,30 +23,30 @@ class CSP:
         self.global_params_snapshot: List[float] = list(self.global_params)
         self.round_count: int = 0
 
-        # 为掉线恢复缓存
+        # 为掉线恢复缓�?
         self.recoveredNiValues: Dict[int, int] = {}
 
         # 保存TA生成的正交向量组
         self.orthogonal_vectors_for_csp: List[List[float]] = []
         self._load_orthogonal_vectors()
 
-        # 使用 ImprovedPaillier，但用 TA 的参数覆盖，确保全局一致
+        # 使用 ImprovedPaillier，但�?TA 的参数覆盖，确保全局一�?
         self.impaillier = ImprovedPaillier(m=self.ta.num_do, bit_length=512, precision=self.precision)
         self._sync_paillier_with_ta()
 
     def _load_orthogonal_vectors(self) -> None:
         self.orthogonal_vectors_for_csp = self.ta.get_orthogonal_vectors_for_csp()
-        print(f"[CSP] 已加载正交向量组，共{len(self.orthogonal_vectors_for_csp)}个向量")
+        print(f"[CSP] 已加载正交向量组，共{len(self.orthogonal_vectors_for_csp)}个向�?)
 
     def _sync_paillier_with_ta(self) -> None:
-        """同步公参，包括 y 参数"""
+        """同步公参，包�?y 参数"""
         N = self.ta.get_N()
         self.impaillier.N = N
         self.impaillier.N2 = N * N
         self.impaillier.g = self.ta.get_g()
         self.impaillier.h = self.ta.get_h()
         
-        # 同步 lambda_ 和 u 参数
+        # 同步 lambda_ �?u 参数
         try:
             self.impaillier.lambda_ = self.ta.get_lambda()
         except Exception:
@@ -57,7 +57,7 @@ class CSP:
         elif hasattr(self.ta, 'mu'):
             self.impaillier.u = self.ta.mu
             
-        # **重要：同步 y 参数，确保解密一致性**
+        # **重要：同�?y 参数，确保解密一致�?*
         try:
             self.impaillier.y = self.ta.get_y()
         except Exception:
@@ -70,16 +70,14 @@ class CSP:
             self.ta.update_keys_for_new_round()
         except Exception as e:
             print(f"[CSP] 密钥更新失败: {e}")
-        # 同步本轮最新的正交向量组
-        self._load_orthogonal_vectors()
         self.global_params_snapshot = list(self.global_params)
         self.round_count += 1
-        print(f"[CSP] 第{self.round_count}轮广播参数: {self.global_params_snapshot}")
+        print(f"[CSP] 第{self.round_count}轮广播参�? {self.global_params_snapshot}")
         return list(self.global_params_snapshot)
 
     # ============== 收集/聚合 ==============
     def aggregate_ciphertexts(self, do_cipher_map: Dict[int, List[int]]) -> List[int]:
-        """逐坐标同态聚合：使用ImprovedPaillier的聚合方法"""
+        """逐坐标同态聚合：使用ImprovedPaillier的聚合方�?""
         aggregated: List[int] = []
 
         for i in range(self.model_size):
@@ -92,11 +90,11 @@ class CSP:
                 aggregated_cipher = self.impaillier.aggregate(coordinate_ciphertexts)
                 aggregated.append(aggregated_cipher)
             else:
-                # 加密0作为占位（使用 SK_DO = 1 即不会影响乘积）
+                # 加密0作为占位（使�?SK_DO = 1 即不会影响乘积）
                 zero_cipher = self.impaillier.encrypt(0.0, 1)
                 aggregated.append(zero_cipher)
 
-        print(f"[CSP] 聚合完成，共{len(aggregated)}个坐标")
+        print(f"[CSP] 聚合完成，共{len(aggregated)}个坐�?)
         return aggregated
 
     # ============== 掉线恢复 ==============
@@ -130,10 +128,10 @@ class CSP:
                     if prime_used is None:
                         prime_used = prime
                     elif prime_used != prime:
-                        print(f"[CSP] 分片素数不一致，忽略DO {do_id} 的分片")
+                        print(f"[CSP] 分片素数不一致，忽略DO {do_id} 的分�?)
                         continue
 
-                    # 注意 shares 的 x 取在线 DO 的编号 + 1（与生成时一致）
+                    # 注意 shares �?x 取在�?DO 的编�?+ 1（与生成时一致）
                     shares_map[do_id + 1] = share_val
 
                     if len(shares_map) >= threshold:
@@ -145,14 +143,14 @@ class CSP:
 
                 recovered_n = recover_secret(shares_map, prime_used)
                 self.recoveredNiValues[missing_id] = recovered_n
-                print(f"[CSP] 成功恢复DO {missing_id} 的 n_i{recovered_n}")
+                print(f"[CSP] 成功恢复DO {missing_id} �?n_i{recovered_n}")
 
             except Exception as e:
-                print(f"[CSP] 恢复DO {missing_id} 时出错: {e}")
+                print(f"[CSP] 恢复DO {missing_id} 时出�? {e}")
 
         return self.recoveredNiValues
 
-    # ============== 解密流程（正常/带恢复） ==============
+    # ============== 解密流程（正�?带恢复） ==============
     def _decrypt_vector(self, aggregated: List[int]) -> List[float]:
         results: List[float] = [0.0] * self.model_size
         for i in range(self.model_size):
@@ -162,11 +160,11 @@ class CSP:
 
     def _decrypt_with_recovery(self, aggregated: List[int], params_hash: int) -> List[float]:
        
-        """恢复缺失 n_i 后解密（保持原逻辑）"""
+        """恢复缺失 n_i 后解密（保持原逻辑�?""
         N2 = self.impaillier.N2
         N = self.impaillier.N
 
-        # 求和 n_i（由 TA 恢复并存入 self.recoveredNiValues）
+        # 求和 n_i（由 TA 恢复并存�?self.recoveredNiValues�?
         sumNi = sum(self.recoveredNiValues.values())
         sumNi = (sumNi * params_hash) % N  # 避免溢出
 
@@ -180,7 +178,7 @@ class CSP:
             print(f"[CSP] 恢复解密坐标 {i}: 原始密文={aggregated[i]}, 修正密文={modified} -> 明文={results[i]}")
         return results
 
-    # ============== 主流程 ==============
+    # ============== 主流�?==============
     def round_aggregate_and_update(self, do_list: List[Optional[object]], do_cipher_map: Dict[int, List[int]]) -> List[
         float]:
         print(f"[CSP] 开始第{self.round_count}轮聚合和更新")
@@ -189,7 +187,7 @@ class CSP:
         online_dos = [d for d in do_list if d is not None]
         missing_ids = [idx for idx, d in enumerate(do_list) if d is None]
         print(f"[CSP] 在线DO: {[d.id for d in online_dos]}, 掉线DO: {missing_ids}")
-            # 计算当前全局参数哈希，如果有DO掉线了，需要使用
+            # 计算当前全局参数哈希，如果有DO掉线了，需要使�?
         params_bytes = str(self.global_params_snapshot).encode('utf-8')
         params_hash = int.from_bytes(hashlib.sha256(params_bytes).digest(), 'big', signed=False)
 
@@ -203,9 +201,10 @@ class CSP:
         print(f"[CSP] 解密后的聚合结果: {summed}")
 
         num_online = max(1, len(online_dos))
-        # DO 侧上传的是“在当前全局参数基础上 +0.5 后的完整参数”，
-        # 因此这里直接取在线 DO 的平均作为新一轮全局参数。
-        next_params = [ (summed[i] / num_online) for i in range(self.model_size) ]
+        next_params = [
+            self.global_params_snapshot[i] + (summed[i] / num_online)
+            for i in range(self.model_size)
+        ]
 
         self.global_params = next_params
         print(f"[CSP] 更新后的全局参数: {next_params}")
@@ -214,13 +213,13 @@ class CSP:
 
     # ============== SafeMul: 1+3轮（PA侧） ==============
     def safe_mul_prepare_payload(self) -> Dict[str, object]:
-        """准备安全点积第1轮数据，基于 CSP 的正交向量组发送 (p, alpha, C_all)。"""
+        """准备安全点积�?轮数据，基于 CSP 的正交向量组发�?(p, alpha, C_all)�?""
         sip = SafeInnerProduct(precision_factor=self.precision)
         p, alpha, C_all, s, s_inv = sip.round1_setup_and_encrypt(self.orthogonal_vectors_for_csp)
         return {'p': p, 'alpha': alpha, 'C_all': C_all, 's_inv': s_inv}
 
     def safe_mul_finalize(self, ctx: Dict[str, object], D_sums: List[int], do_part: List[float]) -> List[float]:
-        """执行安全点积第3轮并与 DO 明文部分求和，得到 w·U 的 1×m 向量。"""
+        """执行安全点积�?轮并�?DO 明文部分求和，得�?w·U �?1×m 向量�?""
         sip = SafeInnerProduct(precision_factor=self.precision)
         p = ctx['p']
         alpha = ctx['alpha']
@@ -235,7 +234,7 @@ if __name__ == "__main__":
     from TA.TA import TA
     from DO.DO import DO
 
-    # 初始化
+    # 初始�?
     ta = TA(num_do=3, model_size=5, orthogonal_vector_count=3, bit_length=512)
     csp = CSP(ta)
     do_list = [DO(i, ta) for i in range(3)]
@@ -243,7 +242,7 @@ if __name__ == "__main__":
     print("\n===== Round 1: 广播参数 =====")
     global_params = csp.broadcast_params()
 
-    print("\n===== Round 1: 收集各 DO 的密文更新 =====")
+    print("\n===== Round 1: 收集�?DO 的密文更�?=====")
     do_cipher_map = {}
     for do in do_list:
         ciphertexts = do.train_and_encrypt(global_params)
@@ -253,7 +252,7 @@ if __name__ == "__main__":
     new_params = csp.round_aggregate_and_update(do_list, do_cipher_map)
     print(f"\n>>> Round 1 结束，新全局参数: {new_params}")
 
-    print("\n===== Round 2: 模拟 DO2 掉线并恢复 =====")
+    print("\n===== Round 2: 模拟 DO2 掉线并恢�?=====")
     global_params = csp.broadcast_params()
     do_list[2] = None  # 模拟掉线
 

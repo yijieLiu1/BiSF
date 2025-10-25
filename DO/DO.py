@@ -16,6 +16,7 @@ import math
 import hashlib
 from typing import List, Optional, Dict, Any
 from utils.ImprovedPaillier import ImprovedPaillier
+from utils.SafeMul import SafeInnerProduct
 
 
 class DO:
@@ -125,24 +126,22 @@ class DO:
     # ============== 本地训练（模拟） ==============
     def _local_train(self, global_params: List[float]) -> List[float]:
         """
-        模拟本地模型训练，每次让模型参数递增0.2
-        后续可以替换为真实的CNN训练
+        模拟本地训练：在当前全局参数基础上 +0.5（每维）
+        后续可以替换为真实的训练逻辑
         Args:
             global_params: 全局模型参数
         Returns:
-            本地训练更新向量
+            本地训练后的“完整参数”向量
         """
         print(f"[DO {self.id}] 开始本地训练，全局参数: {global_params}")
         
-        # 模拟本地训练：每个参数递增0.2
-        # 这里可以后续替换为真实的CNN训练逻辑
-        updates = []
+        # 这里按期望：每维在全局参数基础上 +0.5
+        updates: List[float] = []
         for i in range(self.model_size):
-            # 简单的递增策略，后续可替换为梯度下降等真实训练算法
-            update = 0.5
-            updates.append(update)
+            base = global_params[i] if i < len(global_params) else 0.0
+            updates.append(base + 0.5)
         
-        print(f"[DO {self.id}] 本地训练完成，更新向量: {updates}")
+        print(f"[DO {self.id}] 本地训练完成，更新向量(完整参数): {updates}")
         
         # 记录训练历史
         training_record = {
@@ -189,11 +188,13 @@ class DO:
         
         # 步骤1：基于全局参数更新密钥
         self.update_key(global_params)
+        # 同步最新一轮的正交向量（用于随后 SafeMul）
+        self._load_orthogonal_vectors()
         
         # 步骤2：本地训练
         updates = self._local_train(global_params)
         
-        # 步骤3：使用派生私钥加密训练结果
+        # 步骤3：使用派生私钥加密训练结果（加密的是完整参数而非增量）
         ciphertexts = []
         for i, update in enumerate(updates):
             ciphertext = self._encrypt_value(update)
@@ -219,6 +220,38 @@ class DO:
             DO的正交向量组
         """
         return self.orthogonal_vectors_for_do.copy()
+
+    # ============== SafeMul 第二轮（PB侧） ==============
+    def get_last_updates(self) -> List[float]:
+        """返回最近一次本地训练的更新向量（用于安全点积）"""
+        if not self.training_history:
+            return []
+        return list(self.training_history[-1].get('local_updates', []))
+
+    def safe_mul_round2_process(self, payload: Dict[str, Any], b_vector: List[float]) -> Dict[str, Any]:
+        """
+        执行安全点积协议第2轮：
+        - 使用 CSP 发送的 (p, alpha, C_all) 与本地模型向量 b_vector 计算 D_sums
+        - 同时计算本地部分正交向量组与模型向量的点积（明文），作为 do_part
+        返回 { 'D_sums': List[int], 'do_part': List[float] }
+        """
+        sip = SafeInnerProduct(precision_factor=self.precision)
+        p = payload['p']
+        alpha = payload['alpha']
+        C_all = payload['C_all']
+
+        # Round2: 计算 D_sums
+        D_sums = sip.round2_client_process(b_vector, C_all, alpha, p)
+
+        # 本地 DO 部分的明文点积
+        do_part: List[float] = []
+        for vec in self.orthogonal_vectors_for_do:
+            s = 0.0
+            for x, y in zip(b_vector, vec):
+                s += x * y
+            do_part.append(s)
+
+        return {'D_sums': D_sums, 'do_part': do_part}
 
     # ============== 门限恢复接口 ==============
     def uploadKeyShare(self, missing_do_id: int) -> Optional[int]:

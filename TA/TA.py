@@ -91,7 +91,13 @@ class TA:
 
     # ---------- 正交向量 ----------
     def _generate_orthogonal_vectors(self) -> None:
-        rng = random.Random()
+        # 以轮次和 R_t 混合的安全随机数作为种子，确保每轮不同
+        try:
+            mix = (self.current_round + 1) ^ (self.R_t if isinstance(self.R_t, int) else 0)
+        except Exception:
+            mix = (self.current_round + 1)
+        seed = int.from_bytes(secrets.token_bytes(16), 'big') ^ mix
+        rng = random.Random(seed)
 
         V = [[rng.gauss(0, 1) for _ in range(self.MODEL_SIZE)]
              for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
@@ -208,6 +214,10 @@ class TA:
         
         # 重新计算所有DO的私钥
         self._update_do_private_keys()
+
+        # 每轮刷新正交向量组，并重新拆分给 CSP 与 DO
+        # 防止各轮使用同一组向量影响投毒检测的鲁棒性
+        self._generate_orthogonal_vectors()
         
         # 保存新的密钥信息
         self._save_key_info()

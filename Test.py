@@ -13,13 +13,13 @@ from CSP.CSP import CSP
 from DO.DO import DO
 
 
-def run_federated_simulation(num_rounds: int = 10,
+def run_federated_simulation(num_rounds: int = 3,
                              num_do: int = 5,
                              model_size: int = 5,
                              orthogonal_vector_count: int = 5,
                              bit_length: int = 512,
                              precision: int = 10 ** 6,
-                             dropout_round: int = 9,
+                             dropout_round: int = 2,
                              dropout_do_id: int = 2) -> None:
     """
     运行联邦学习模拟：
@@ -50,6 +50,20 @@ def run_federated_simulation(num_rounds: int = 10,
         # CSP 广播参数时，TA 会更新密钥（R_t 与各 DO 的基础私钥）
         global_params = csp.broadcast_params()
 
+        # 输出 TA 本轮使用的正交向量组（原始/拆分给 CSP 与 DO 的两份）
+        base_vectors = ta.get_orthogonal_vectors()
+        csp_vectors = ta.get_orthogonal_vectors_for_csp()
+        do_vectors = ta.get_orthogonal_vectors_for_do()
+        print(f"[Round {round_idx}] TA 正交向量组(共 {len(base_vectors)} 个，维度 {len(base_vectors[0]) if base_vectors else 0})：")
+        for i, vec in enumerate(base_vectors):
+            print(f"  U[{i}] = {vec}")
+        print(f"[Round {round_idx}] 分配给 CSP 的向量组：")
+        for i, vec in enumerate(csp_vectors):
+            print(f"  U_csp[{i}] = {vec}")
+        print(f"[Round {round_idx}] 分配给 DO 的向量组：")
+        for i, vec in enumerate(do_vectors):
+            print(f"  U_do[{i}] = {vec}")
+
         # 构造当轮 DO 列表（第 dropout_round 轮模拟掉线）
         if round_idx == dropout_round:
             print(f"[TEST] 模拟 DO {dropout_do_id} 在本轮掉线")
@@ -64,6 +78,16 @@ def run_federated_simulation(num_rounds: int = 10,
         for do in [d for d in working_do_list if d is not None]:
             ciphertexts = do.train_and_encrypt(global_params)
             do_cipher_map[do.id] = ciphertexts
+
+        # 触发 SafeMul 三轮协议，计算每个在线 DO 的 w·U 投影（用于投毒检测）
+        print(f"\n===== Round {round_idx}: SafeMul 投影计算（每个在线 DO） =====")
+        ctx = csp.safe_mul_prepare_payload()
+        for do in [d for d in working_do_list if d is not None]:
+            b_vec = do.get_last_updates()
+            payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
+            resp = do.safe_mul_round2_process(payload, b_vec)
+            projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'])
+            print(f"[Round {round_idx}] DO {do.id} 投影向量(长度{len(projection)}): {projection}")
 
         # CSP 聚合与（必要时）门限恢复解密并更新
         print(f"\n===== Round {round_idx}: CSP 聚合 + 解密更新 =====")
