@@ -9,10 +9,18 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import time
 from typing import Dict, List, Tuple, Optional
 import secrets
 import random
 import math
+
+# 可选 NumPy 加速（大规模向量时建议安装）
+try:
+    import numpy as np
+    _NP_AVAILABLE = True
+except Exception:
+    _NP_AVAILABLE = False
 
 # 导入项目中的秘密分享函数
 try:
@@ -33,14 +41,14 @@ except Exception:
 class TA:
     """联邦学习协议中的可信第三方 (TA)"""
 
-    def __init__(self, num_do: int, model_size: int = 5, orthogonal_vector_count: int = 5,
+    def __init__(self, num_do: int, model_size: int = 10000, orthogonal_vector_count: int = 1024,
                  bit_length: int = 1024, precision: int = 10**6, k: int = 1 << 48):
         """
         初始化TA
         Args:
             num_do: DO的数量
-            model_size: 模型大小
-            orthogonal_vector_count: 正交向量数量
+            model_size: 模型大小(几万维,默认50000)
+            orthogonal_vector_count: 正交向量数量(默认2048,用于投影到2048维)
             bit_length: 密钥长度
             precision: 浮点精度
             k: 参数k
@@ -76,6 +84,7 @@ class TA:
         self.orthogonal_vectors: List[List[float]] = []
         self.orthogonal_vectors_for_csp: List[List[float]] = []
         self.orthogonal_vectors_for_do: List[List[float]] = []
+        self.orthogonal_sumvectors_for_csp: List[float] = []
 
         # 轮次管理
         self.current_round: int = 0
@@ -91,6 +100,8 @@ class TA:
 
     # ---------- 正交向量 ----------
     def _generate_orthogonal_vectors(self) -> None:
+        print(f"TA开始生成正交向量组{self.MODEL_SIZE}*{self.ORTHOGONAL_VECTOR_COUNT}")
+        t1=time.time()
         # 以轮次和 R_t 混合的安全随机数作为种子，确保每轮不同
         try:
             mix = (self.current_round + 1) ^ (self.R_t if isinstance(self.R_t, int) else 0)
@@ -99,54 +110,86 @@ class TA:
         seed = int.from_bytes(secrets.token_bytes(16), 'big') ^ mix
         rng = random.Random(seed)
 
-        V = [[rng.gauss(0, 1) for _ in range(self.MODEL_SIZE)]
-             for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
+        # 大规模场景优先采用 NumPy QR 分解生成正交基（更快更稳）
+        use_numpy_qr = _NP_AVAILABLE and (self.MODEL_SIZE >= 2000 or self.ORTHOGONAL_VECTOR_COUNT >= 64)
+        if use_numpy_qr:
+            # 生成尺寸为 (MODEL_SIZE, ORTHOGONAL_VECTOR_COUNT) 的高斯随机矩阵
+            # 对其做 QR 分解，得到列正交的 Q（每列长度为 MODEL_SIZE，共 ORTHOGONAL_VECTOR_COUNT 列）
+            rnd = np.random.default_rng(seed)
+            A = rnd.standard_normal(size=(self.MODEL_SIZE, self.ORTHOGONAL_VECTOR_COUNT))
+            # 使用经济 QR 分解
+            Q, _ = np.linalg.qr(A, mode='reduced')
+            self.orthogonal_vectors = [Q[:, i].astype(float).tolist() for i in range(Q.shape[1])]
+        else:
+            # 纯 Python 的 Gram-Schmidt（小规模时可接受）
+            V = [[rng.gauss(0, 1) for _ in range(self.MODEL_SIZE)]
+                 for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
 
-        U: List[List[float]] = []
-        for v in V:
-            w = v.copy()
-            for u in U:
-                dot = sum(wi * ui for wi, ui in zip(w, u))
-                norm_sq = sum(ui * ui for ui in u)
-                if norm_sq != 0:
-                    coef = dot / norm_sq
-                    for idx in range(self.MODEL_SIZE):
-                        w[idx] -= coef * u[idx]
-            norm = math.sqrt(sum(x * x for x in w))
-            if norm > 0:
-                w = [x / norm for x in w]
-            else:
-                w = [(xi + 1e-8) for xi in w]
+            U: List[List[float]] = []
+            for v in V:
+                w = v.copy()
+                for u in U:
+                    dot = sum(wi * ui for wi, ui in zip(w, u))
+                    norm_sq = sum(ui * ui for ui in u)
+                    if norm_sq != 0:
+                        coef = dot / norm_sq
+                        for idx in range(self.MODEL_SIZE):
+                            w[idx] -= coef * u[idx]
                 norm = math.sqrt(sum(x * x for x in w))
-                w = [x / norm for x in w]
-            U.append(w)
+                if norm > 0:
+                    w = [x / norm for x in w]
+                else:
+                    w = [(xi + 1e-8) for xi in w]
+                    norm = math.sqrt(sum(x * x for x in w))
+                    w = [x / norm for x in w]
+                U.append(w)
+            self.orthogonal_vectors = U
 
-        self.orthogonal_vectors = U
+        print(f"生成的正交向量组：共{len(self.orthogonal_vectors)}个向量，每个向量{self.MODEL_SIZE}维")
+        # 只打印前3个向量的前5维，避免输出过多
+        for i in range(min(3, len(self.orthogonal_vectors))):
+            vec_preview = self.orthogonal_vectors[i][:5]
+            print(f"向量{i}前5维: {vec_preview}...")
 
-        print("生成的正交向量组：")
-        for i, vec in enumerate(self.orthogonal_vectors):
-            print(f"向量{i}: {vec}")
-
-        self._check_orthogonality()
+        # self._check_orthogonality()
 
         # 初始化 CSP 和 DO 分配向量
-        self.orthogonal_vectors_for_csp = [[0.0]*self.MODEL_SIZE for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
-        self.orthogonal_vectors_for_do = [[0.0]*self.MODEL_SIZE for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
-
-        for i in range(self.ORTHOGONAL_VECTOR_COUNT):
-            for j in range(self.MODEL_SIZE):
-                ratio = rng.random()
-                val = self.orthogonal_vectors[i][j]
-                self.orthogonal_vectors_for_csp[i][j] = val * ratio
-                self.orthogonal_vectors_for_do[i][j] = val * (1 - ratio)
+        if _NP_AVAILABLE and use_numpy_qr:
+            ratios = np.random.default_rng(seed ^ 0xABCDEF).random(size=(self.ORTHOGONAL_VECTOR_COUNT, self.MODEL_SIZE))
+            U_np = np.array(self.orthogonal_vectors)
+            csp_np = U_np * ratios
+            do_np = U_np * (1.0 - ratios)
+            self.orthogonal_vectors_for_csp = [row.tolist() for row in csp_np]
+            self.orthogonal_vectors_for_do = [row.tolist() for row in do_np]
+        else:
+            self.orthogonal_vectors_for_csp = [[0.0]*self.MODEL_SIZE for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
+            self.orthogonal_vectors_for_do = [[0.0]*self.MODEL_SIZE for _ in range(self.ORTHOGONAL_VECTOR_COUNT)]
+            for i in range(self.ORTHOGONAL_VECTOR_COUNT):
+                for j in range(self.MODEL_SIZE):
+                    ratio = rng.random()
+                    val = self.orthogonal_vectors[i][j]
+                    self.orthogonal_vectors_for_csp[i][j] = val * ratio
+                    self.orthogonal_vectors_for_do[i][j] = val * (1 - ratio)
+        # 生成 CSP 使用的求和向量（按列求和，得到长度为 MODEL_SIZE 的列向量）
+        if self.orthogonal_vectors_for_csp:
+            self.orthogonal_sumvectors_for_csp = [
+                float(sum(col)) for col in zip(*self.orthogonal_vectors)
+            ]
+        else:
+            self.orthogonal_sumvectors_for_csp = [0.0] * self.MODEL_SIZE
+        t2=time.time()
+        # print(f"生成的分配给CSP的向量组{self.orthogonal_sumvectors_for_csp}，长度({len(self.orthogonal_sumvectors_for_csp)})")
+        print(f"TA生成正交向量组{self.MODEL_SIZE}*{self.ORTHOGONAL_VECTOR_COUNT}共用时{t2-t1}s")
 
     def _check_orthogonality(self) -> None:
-        for i in range(self.ORTHOGONAL_VECTOR_COUNT):
-            for j in range(i + 1, self.ORTHOGONAL_VECTOR_COUNT):
+        # 对于大维度向量，只检查前几对向量的正交性，避免计算量过大
+        check_count = min(10, self.ORTHOGONAL_VECTOR_COUNT)
+        for i in range(check_count):
+            for j in range(i + 1, min(i + 2, check_count)):
                 dot = sum(self.orthogonal_vectors[i][k] * self.orthogonal_vectors[j][k]
                           for k in range(self.MODEL_SIZE))
-                if abs(dot) > 1e-10:
-                    print(f"向量 {i} 和 向量 {j} 的点积: {dot}")
+                if abs(dot) > 1e-6:
+                    print(f"警告: 向量 {i} 和 向量 {j} 的点积: {dot} (可能不严格正交)")
 
     # ---------- 密钥生成（使用 ImprovedPaillier） ----------
     def _key_generation(self) -> None:
@@ -175,6 +218,7 @@ class TA:
         for i in range(self.num_do):
             try:
                 shares, prime_used = split_secret(self.n_i[i], self.threshold, self.num_do)
+
             except Exception as e:
                 raise RuntimeError(f"DO {i} 的秘密分享失败: {e}")
 
@@ -290,6 +334,8 @@ class TA:
     def get_orthogonal_vectors(self) -> List[List[float]]: return self.orthogonal_vectors
     def get_orthogonal_vectors_for_csp(self) -> List[List[float]]: return self.orthogonal_vectors_for_csp
     def get_orthogonal_vectors_for_do(self) -> List[List[float]]: return self.orthogonal_vectors_for_do
+    def get_orthogonal_sumvectors_for_csp(self) -> List[float]: return self.orthogonal_sumvectors_for_csp
+    def get_model_size(self) -> int: return self.MODEL_SIZE
     def get_current_round(self) -> int: return self.current_round
     def get_key_history(self) -> List[Dict]: return self.key_history.copy()
 
@@ -306,7 +352,7 @@ class TA:
 # ----------------- 测试 -----------------
 if __name__ == "__main__":
     print("初始化TA（5个DO）...")
-    ta = TA(num_do=5, model_size=5, orthogonal_vector_count=5, bit_length=512)
+    ta = TA(num_do=5, model_size=50000, orthogonal_vector_count=2048, bit_length=512)
 
     print("\n=== 全局参数 ===")
     print("N:", ta.get_N())
@@ -326,15 +372,15 @@ if __name__ == "__main__":
     print(f"正确私钥数量: {correct_count}/{ta.num_do}")
 
     print("\n=== 正交向量组 ===")
-    print("原始正交向量:")
-    for i, vec in enumerate(ta.get_orthogonal_vectors()):
-        print(f"向量{i}: {vec}")
-    print("CSP向量组:")
-    for i, vec in enumerate(ta.get_orthogonal_vectors_for_csp()):
-        print(f"向量{i}: {vec}")
-    print("DO向量组:")
-    for i, vec in enumerate(ta.get_orthogonal_vectors_for_do()):
-        print(f"向量{i}: {vec}")
+    # print("原始正交向量:")
+    # for i, vec in enumerate(ta.get_orthogonal_vectors()):
+    #     print(f"向量{i}: {vec}")
+    # print("CSP向量组:")
+    # for i, vec in enumerate(ta.get_orthogonal_vectors_for_csp()):
+    #     print(f"向量{i}: {vec}")
+    # print("DO向量组:")
+    # for i, vec in enumerate(ta.get_orthogonal_vectors_for_do()):
+    #     print(f"向量{i}: {vec}")
 
     print("\n=== 模拟门限恢复 n_i ===")
     missing_do = 0

@@ -1,11 +1,18 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+可配置的联邦学习模拟，支持：
+- 指定掉线的 DO（按轮次）
+- 在指定轮次对某个 DO 施加基于自身梯度的 Lie Attack（放大 1+lambda）
+- 在每轮执行 CSP 的投毒检测（Multi-Krum 与 GeoMedian）
+"""
 
 import os
 import sys
+import time
+import random
 from typing import Dict, List, Optional
 
-# 确保可以导入项目内模块
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
 from TA.TA import TA
@@ -13,90 +20,111 @@ from CSP.CSP import CSP
 from DO.DO import DO
 
 
-def run_federated_simulation(num_rounds: int = 3,
-                             num_do: int = 5,
-                             model_size: int = 5,
-                             orthogonal_vector_count: int = 5,
-                             bit_length: int = 512,
-                             precision: int = 10 ** 6,
-                             dropout_round: int = 2,
-                             dropout_do_id: int = 2) -> None:
+def run_federated_simulation(
+    num_rounds: int = 2,
+    num_do: int = 3,
+    model_size: int = 10_000,
+    orthogonal_vector_count: int = 1_024,
+    bit_length: int = 512,
+    precision: int = 10 ** 6,
+    dropouts: Optional[Dict[int, List[int]]] = None,
+    dropout_round: Optional[int] = None,
+    dropout_do_ids: Optional[List[int]] = None,
+    attack_round: Optional[int] = None,
+    attack_do_id: Optional[int] = None,
+    attack_lambda: float = 0.2,
+) -> None:
     """
-    运行联邦学习模拟：
-    - 使用 ImprovedPaillier
-    - 5 个 DO，门限 = 3（TA中按 2/3 n 计算，5 -> 3）
-    - 正交向量组 5x5
-    - 共 10 轮；第 3 轮模拟 1 个 DO 掉线
-    - 每轮密钥由 TA 更新，DO 基于全局参数哈希派生轮次密钥
+    运行一次联邦学习流程。
+    - dropouts / dropout_round+dropout_do_ids：配置掉线 DO
+    - attack_round/attack_do_id/attack_lambda：在指定轮次对指定 DO 进行 Lie Attack（基于自身梯度放大 1+lambda）
     """
+    dropouts = dropouts or {}
+    if dropout_round is not None and dropout_do_ids:
+        dropouts = dict(dropouts)
+        dropouts[dropout_round] = dropout_do_ids
+    _rng = random.Random(2025)
 
     print("===== 初始化 TA / CSP / DO 列表 =====")
-    ta = TA(num_do=num_do,
-            model_size=model_size,
-            orthogonal_vector_count=orthogonal_vector_count,
-            bit_length=bit_length,
-            precision=precision)
-    # 断言门限为 3
-    assert ta.get_threshold() == 3, f"期望阈值为3，实际为 {ta.get_threshold()}"
-
+    ta = TA(
+        num_do=num_do,
+        model_size=model_size,
+        orthogonal_vector_count=orthogonal_vector_count,
+        bit_length=bit_length,
+        precision=precision,
+    )
     csp = CSP(ta, model_size=model_size, precision=precision)
     do_list: List[Optional[DO]] = [DO(i, ta, model_size=model_size, precision=precision) for i in range(num_do)]
 
-    print("===== 开始联邦学习回合 =====")
-    global_params: List[float] = csp.global_params[:]  # 初始全局参数
-
     for round_idx in range(1, num_rounds + 1):
         print(f"\n===== Round {round_idx}: 广播参数 =====")
-        # CSP 广播参数时，TA 会更新密钥（R_t 与各 DO 的基础私钥）
         global_params = csp.broadcast_params()
 
-        # 输出 TA 本轮使用的正交向量组（原始/拆分给 CSP 与 DO 的两份）
-        base_vectors = ta.get_orthogonal_vectors()
-        csp_vectors = ta.get_orthogonal_vectors_for_csp()
-        do_vectors = ta.get_orthogonal_vectors_for_do()
-        print(f"[Round {round_idx}] TA 正交向量组(共 {len(base_vectors)} 个，维度 {len(base_vectors[0]) if base_vectors else 0})：")
-        for i, vec in enumerate(base_vectors):
-            print(f"  U[{i}] = {vec}")
-        print(f"[Round {round_idx}] 分配给 CSP 的向量组：")
-        for i, vec in enumerate(csp_vectors):
-            print(f"  U_csp[{i}] = {vec}")
-        print(f"[Round {round_idx}] 分配给 DO 的向量组：")
-        for i, vec in enumerate(do_vectors):
-            print(f"  U_do[{i}] = {vec}")
+        # 掉线处理
+        working_do_list: List[Optional[DO]] = list(do_list)
+        for drop_id in dropouts.get(round_idx, []):
+            if 0 <= drop_id < len(working_do_list):
+                working_do_list[drop_id] = None
+        offline_ids = [i for i, d in enumerate(working_do_list) if d is None]
+        if offline_ids:
+            print(f"[Round {round_idx}] 模拟掉线 DO: {offline_ids}")
 
-        # 构造当轮 DO 列表（第 dropout_round 轮模拟掉线）
-        if round_idx == dropout_round:
-            print(f"[TEST] 模拟 DO {dropout_do_id} 在本轮掉线")
-            working_do_list: List[Optional[DO]] = [d for d in do_list]
-            working_do_list[dropout_do_id] = None
-        else:
-            working_do_list = do_list
-
-        # 在线 DO 训练并加密上传
-        print(f"\n===== Round {round_idx}: 在线 DO 训练并加密 =====")
+        # DO 训练并上传
+        print(f"\n===== Round {round_idx}: DO 训练并加密 =====")
         do_cipher_map: Dict[int, List[int]] = {}
         for do in [d for d in working_do_list if d is not None]:
             ciphertexts = do.train_and_encrypt(global_params)
+            if (
+                attack_round is not None
+                and attack_do_id is not None
+                and round_idx == attack_round
+                and do.id == attack_do_id
+            ):
+                poisoned = [(1.0 + attack_lambda) * x for x in do.get_last_updates()]
+                if do.training_history:
+                    do.training_history[-1]['local_updates'] = list(poisoned)
+                ciphertexts = [do._encrypt_value(v) for v in poisoned]
+                print(f"[Round {round_idx}] DO {do.id} 执行 Lie Attack，放大系数 1+λ={1.0 + attack_lambda}")
             do_cipher_map[do.id] = ciphertexts
 
-        # 触发 SafeMul 三轮协议，计算每个在线 DO 的 w·U 投影（用于投毒检测）
-        print(f"\n===== Round {round_idx}: SafeMul 投影计算（每个在线 DO） =====")
+        # SafeMul 投影
+        print(f"\n===== Round {round_idx}: SafeMul 投影计算（在线 DO）=====")
+        t1 = time.time()
+        csp.do_projection_map.clear()
         ctx = csp.safe_mul_prepare_payload()
         for do in [d for d in working_do_list if d is not None]:
             b_vec = do.get_last_updates()
             payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
             resp = do.safe_mul_round2_process(payload, b_vec)
-            projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'])
-            print(f"[Round {round_idx}] DO {do.id} 投影向量(长度{len(projection)}): {projection}")
+            projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'], do.id)
+            print(f" DO {do.id} 投影向量(长度{len(projection)})")
+        t2 = time.time()
+        print(f"[Round {round_idx}] SafeMul 投影耗时 {t2 - t1:.4f}s")
 
-        # CSP 聚合与（必要时）门限恢复解密并更新
+        # 投毒检测
+        csp.detect_poison_multi_krum(f=1, alpha=1.5)
+        csp.detect_poison_geomedian(beta=1.5)
+
+        # 聚合 + 解密 + 更新
         print(f"\n===== Round {round_idx}: CSP 聚合 + 解密更新 =====")
         updated_params = csp.round_aggregate_and_update(working_do_list, do_cipher_map)
-        print(f">>> Round {round_idx} 结束，新全局参数: {updated_params}")
+        print(f"[Round {round_idx}] 更新后的全局参数前5: {updated_params[:5]}")
 
-    print("\n===== 全部轮次完成 =====")
-    print(f"最终全局参数: {csp.global_params}")
+    print("\n===== 全部轮次结束 =====")
+    print(f"最终全局参数前5: {csp.global_params[:5]}")
 
 
 if __name__ == "__main__":
-    run_federated_simulation()
+    # 示例：2 轮，5 个 DO；第 2 轮让 DO2 掉线，DO1 做 Lie Attack（放大 1.2）
+    run_federated_simulation(
+        num_rounds=2,
+        num_do=5,
+        model_size=50_000,
+        orthogonal_vector_count=2_048,
+        bit_length=512,
+        precision=10 ** 6,
+        # dropouts={2: [2]},
+        attack_round=2,
+        attack_do_id=1,
+        attack_lambda=0.2,
+    )

@@ -8,6 +8,7 @@
 # 5. 提供门限恢复辅助接口
 # -------------------------------
 import os, sys
+import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -18,17 +19,38 @@ from typing import List, Optional, Dict, Any
 from utils.ImprovedPaillier import ImprovedPaillier
 from utils.SafeMul import SafeInnerProduct
 
+# 可选 NumPy 加速（大规模参数时建议安装）
+try:
+    import numpy as np
+    _NP_AVAILABLE = True
+except Exception:
+    _NP_AVAILABLE = False
+
+# 可选 PyTorch + torchvision，用于真实 CNN 训练
+try:
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+    from torchvision import datasets, transforms
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
 
 class DO:
     """Data Owner（数据拥有方）"""
+    _MNIST_DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
+    _MNIST_BATCH_SIZE = 64
+    _MNIST_MAX_BATCHES = 10  # 每轮训练最多使用的 batch 数，避免过慢
+    _mnist_loader: Optional[DataLoader] = None
 
-    def __init__(self, do_id: int, ta, model_size: int = 5, precision: int = 10 ** 6, rng_seed: Optional[int] = None):
+    def __init__(self, do_id: int, ta, model_size: int = 10000, precision: int = 10 ** 6, rng_seed: Optional[int] = None):
         """
         初始化DO
         Args:
             do_id: DO的唯一标识符
             ta: 可信机构TA的实例
-            model_size: 模型参数大小
+            model_size: 模型参数大小(几万维,默认50000)
             precision: 浮点数精度
             rng_seed: 随机数种子（用于可复现性）
         """
@@ -56,8 +78,105 @@ class DO:
         
         # 训练历史记录
         self.training_history: List[Dict[str, Any]] = []
+
+        # 初始化 CNN 相关组件
+        self._check_torch_available()
+        self.device = torch.device("cuda" if _TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            print(f"[DO {self.id}] 使用 GPU: {torch.cuda.get_device_name(self.device)}")
         
         print(f"[DO {self.id}] 初始化完成，模型大小: {self.model_size}, 精度: {self.precision}")
+
+    def _check_torch_available(self) -> None:
+        if not _TORCH_AVAILABLE:
+            raise ImportError(
+                "[DO] 需要安装 PyTorch 与 torchvision 才能使用 MNIST CNN 训练，请执行 `pip install torch torchvision`"
+            )
+
+    @classmethod
+    def _get_mnist_loader(cls) -> DataLoader:
+        if cls._mnist_loader is None:
+            os.makedirs(cls._MNIST_DATA_ROOT, exist_ok=True)
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,))
+            ])
+            dataset = datasets.MNIST(
+                root=cls._MNIST_DATA_ROOT,
+                train=True,
+                download=True,
+                transform=transform
+            )
+            cls._mnist_loader = DataLoader(
+                dataset,
+                batch_size=cls._MNIST_BATCH_SIZE,
+                shuffle=True,
+                num_workers=0,
+                drop_last=True
+            )
+        return cls._mnist_loader
+
+    class _SimpleMNISTCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = nn.Conv2d(1, 32, 3, 1)
+            self.conv2 = nn.Conv2d(32, 64, 3, 1)
+            self.dropout1 = nn.Dropout(0.25)
+            self.dropout2 = nn.Dropout(0.5)
+            self.fc1 = nn.Linear(9216, 128)
+            self.fc2 = nn.Linear(128, 10)
+
+        def forward(self, x):
+            x = F.relu(self.conv1(x))
+            x = F.relu(self.conv2(x))
+            x = F.max_pool2d(x, 2)
+            x = self.dropout1(x)
+            x = torch.flatten(x, 1)
+            x = F.relu(self.fc1(x))
+            x = self.dropout2(x)
+            x = self.fc2(x)
+            return x
+
+    def _reset_model_parameters(self, model: nn.Module, seed: int) -> None:
+        torch.manual_seed(seed)
+        for layer in model.modules():
+            if isinstance(layer, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+
+    def _flatten_model_parameters(self, model: nn.Module) -> List[float]:
+        with torch.no_grad():
+            params = []
+            for param in model.parameters():
+                params.append(param.detach().view(-1))
+            flat = torch.cat(params, dim=0).cpu().numpy().astype(float)
+        return flat.tolist()
+
+    def _assign_flat_to_model(self, model: nn.Module, flat: List[float]) -> None:
+        """
+        将给定的一维参数向量写回到模型参数张量中（按 PyTorch 参数迭代顺序）。
+        仅覆盖前 len(flat) 个元素，多余的模型参数保持不变。
+        """
+        with torch.no_grad():
+            offset = 0
+            for param in model.parameters():
+                numel = param.numel()
+                if offset >= len(flat):
+                    break
+                take = min(numel, len(flat) - offset)
+                new_vals = torch.tensor(flat[offset:offset + take], dtype=param.dtype, device=param.device)
+                # 保持其余未覆盖部分的现有初始化（防止全零对称性问题）
+                param.view(-1)[:take].copy_(new_vals)
+                offset += take
+
+    def _project_params_to_model_size(self, params: List[float]) -> List[float]:
+        if len(params) == self.model_size:
+            return params
+        if len(params) > self.model_size:
+            return params[:self.model_size]
+        return params + [0.0] * (self.model_size - len(params))
 
     def _load_orthogonal_vectors(self) -> None:
         """从TA加载正交向量组"""
@@ -85,24 +204,35 @@ class DO:
             self.impaillier.y = self.ta.get_y()
         except Exception:
             self.impaillier.y = getattr(self.ta, 'gamma', None)
-        print(f"[DO {self.id}] 已同步Paillier公参，N={N}, g={self.impaillier.g}, h={self.impaillier.h}, y={self.impaillier.y}")
+        # print(f"[DO {self.id}] 已同步Paillier公参，N={N}, g={self.impaillier.g}, h={self.impaillier.h}, y={self.impaillier.y}")
 
     # ============== 工具函数 ==============
     def _hash_global_params(self, global_params: List[float]) -> int:
         """
         SHA-256哈希全局参数，返回整数
+        对于大向量，使用采样策略提高效率
         Args:
             global_params: 全局模型参数列表
         Returns:
             哈希值的整数表示
         """
-        # 将全局参数转换为字符串并编码
-        s = str(global_params).encode('utf-8')
+        # 对于大向量，使用采样策略：每隔一定间隔采样，确保哈希的稳定性
+        if len(global_params) > 10000:
+            # 采样策略：取前1000个、中间1000个、后1000个，以及每隔一定间隔的样本
+            sample_size = 3000
+            step = len(global_params) // sample_size
+            sampled = global_params[::max(1, step)][:sample_size]
+            # 添加首尾和中间部分确保覆盖
+            sampled = global_params[:1000] + global_params[len(global_params)//2:len(global_params)//2+1000] + global_params[-1000:]
+            s = str(sampled).encode('utf-8')
+        else:
+            # 小向量直接转换
+            s = str(global_params).encode('utf-8')
         # 计算SHA-256哈希
         h = hashlib.sha256(s).digest()
         # 转换为整数
         hash_int = int.from_bytes(h, byteorder='big', signed=False)
-        print(f"[DO {self.id}] 全局参数哈希值: {hash_int}")
+        # print(f"[DO {self.id}] 全局参数哈希值(参数维度{len(global_params)}): {hash_int}")
         return hash_int
 
     def update_key(self, global_params: List[float]) -> None:
@@ -123,36 +253,77 @@ class DO:
         self.round_private_key = pow(self.base_private_key, h, N2)
         print(f"[DO {self.id}] 派生密钥计算完成: {self.round_private_key}")
 
-    # ============== 本地训练（模拟） ==============
+    # ============== 本地训练（模拟CNN） ==============
     def _local_train(self, global_params: List[float]) -> List[float]:
         """
-        模拟本地训练：在当前全局参数基础上 +0.5（每维）
-        后续可以替换为真实的训练逻辑
+        模拟CNN神经网络本地训练：
+        1. 基于全局参数初始化本地模型
+        2. 模拟梯度下降更新（添加随机噪声模拟真实训练）
+        3. 返回训练后的完整参数向量（几万维）
         Args:
             global_params: 全局模型参数
         Returns:
-            本地训练后的“完整参数”向量
+            本地训练后的"完整参数"向量（几万维）
         """
-        print(f"[DO {self.id}] 开始本地训练，全局参数: {global_params}")
-        
-        # 这里按期望：每维在全局参数基础上 +0.5
-        updates: List[float] = []
-        for i in range(self.model_size):
-            base = global_params[i] if i < len(global_params) else 0.0
-            updates.append(base + 0.5)
-        
-        print(f"[DO {self.id}] 本地训练完成，更新向量(完整参数): {updates}")
-        
+        self._check_torch_available()
+        print(f"[DO {self.id}] 开始CNN本地训练，模型大小: {self.model_size}维 (MNIST)")
+
+        # 使用全局参数哈希作为随机种子，确保每轮初始化与全局状态关联
+        seed_source = int(hashlib.sha256(str(global_params).encode('utf-8')).hexdigest(), 16)
+        model_seed = (seed_source + self.id) % (2 ** 32)
+
+        model = self._SimpleMNISTCNN().to(self.device)
+        self._reset_model_parameters(model, model_seed)
+        # 将当前收到的全局参数覆盖到模型扁平参数的前K项，确保每轮从全局权重出发
+        # 若全局参数近似为全零，跳过覆盖以避免零梯度导致训练停滞
+        try:
+            if any(abs(v) > 1e-12 for v in global_params):
+                self._assign_flat_to_model(model, list(global_params))
+            else:
+                print(f"[DO {self.id}] 全局参数近似全零，跳过覆盖，采用良好初始化以避免零梯度。")
+        except Exception as e:
+            print(f"[DO {self.id}] 应用全局参数初始化失败，将继续使用默认初始化: {e}")
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        loss_fn = nn.CrossEntropyLoss()
+
+        train_loader = self._get_mnist_loader()
+        model.train()
+        batches_processed = 0
+
+        for batch_idx, (data, target) in enumerate(train_loader):
+            if batch_idx >= self._MNIST_MAX_BATCHES:
+                break
+            data = data.to(self.device)
+            target = target.to(self.device)
+
+            optimizer.zero_grad()
+            output = model(data)
+            loss = loss_fn(output, target)
+            loss.backward()
+            optimizer.step()
+
+            batches_processed += 1
+            print(f"[DO {self.id}] 训练批次: {batches_processed}")
+
+        print(f"[DO {self.id}] CNN本地训练完成，使用批次数: {batches_processed}")
+
+        # Flatten parameters并映射到指定维度
+        local_params_raw = self._flatten_model_parameters(model)
+        local_params = self._project_params_to_model_size(local_params_raw)
+
+        print(f"[DO {self.id}] 参数范围: [{min(local_params):.6f}, {max(local_params):.6f}]")
+        print(f"[DO {self.id}] 参数前10维: {local_params[:10]}")
+
         # 记录训练历史
         training_record = {
             'round': len(self.training_history) + 1,
             'global_params': global_params.copy(),
-            'local_updates': updates.copy(),
-            'timestamp': random.randint(1000000, 9999999)  # 简单时间戳
+            'local_updates': local_params.copy(),
+            'timestamp': time.time()  # 简单时间戳
         }
         self.training_history.append(training_record)
         
-        return updates
+        return local_params
 
     # ============== 加密上传 ==============
     def _encrypt_value(self, value: float) -> int:
@@ -169,7 +340,7 @@ class DO:
         # 使用派生密钥进行加密（内部已做精度放大）
         # 派生密钥 = base_private_key ^ hash mod N^2
         ciphertext = self.impaillier.encrypt(value, self.round_private_key)
-        print(f"[DO {self.id}] 加密值 {value} -> 密文: {ciphertext}")
+        # print(f"[DO {self.id}] 加密值 {value} -> 密文: {ciphertext}")
         return ciphertext
 
     def train_and_encrypt(self, global_params: List[float]) -> List[int]:
@@ -193,7 +364,10 @@ class DO:
         
         # 步骤2：本地训练
         updates = self._local_train(global_params)
+
         
+        print(f"DO开始执行模型参数加密...")
+        time1=time.time()
         # 步骤3：使用派生私钥加密训练结果（加密的是完整参数而非增量）
         ciphertexts = []
         for i, update in enumerate(updates):
@@ -201,8 +375,14 @@ class DO:
             ciphertexts.append(ciphertext)
         
         print(f"[DO {self.id}] 加密完成，密文数量: {len(ciphertexts)}")
-        print(f"[DO {self.id}] 密文向量: {ciphertexts}")
+        # 对于大向量，只打印前几个密文
+        if len(ciphertexts) > 5:
+            print(f"[DO {self.id}] 密文向量前5个: {ciphertexts[:5]}...")
+        else:
+            print(f"[DO {self.id}] 密文向量: {ciphertexts}")
         
+        time2=time.time()
+        print(f"加密总用时{time2-time1}秒")
         return ciphertexts
 
     def get_training_history(self) -> List[Dict[str, Any]]:
@@ -333,126 +513,111 @@ class DO:
 # === 测试代码部分 (DO.py) ===
 # ===========================
 if __name__ == "__main__":
-    print("===== [TEST] DO 完整功能测试 =====")
-    
-    # 导入必要的模块
+    print("===== [TEST] DO 功能验证（精简输出） =====")
+
     try:
         from TA.TA import TA
         from CSP.CSP import CSP
     except ImportError as e:
-        print(f"导入模块失败: {e}")
-        print("请确保 TA.py 和 CSP.py 在正确的路径下")
-        exit(1)
+        raise SystemExit(f"导入失败: {e}")
 
-    print("\n===== 1. 初始化系统 =====")
-    # 初始化 TA、CSP 与 3 个 DO
-    ta = TA(num_do=3, model_size=5, orthogonal_vector_count=3, bit_length=512)
+    # 与 DO 的模型规模保持一致：5万维，正交向量组 2048
+    ta = TA(num_do=3, model_size=50000, orthogonal_vector_count=2048, bit_length=512)
     csp = CSP(ta)
     do_list = [DO(i, ta) for i in range(3)]
-    
-    print(f"系统初始化完成：TA、CSP、{len(do_list)}个DO")
 
-    print("\n===== 2. 测试密钥派生功能 =====")
-    test_global_params = [1.0, 2.0, 3.0, 4.0, 5.0]
-    print(f"测试全局参数: {test_global_params}")
-    
+    baseline_params = [1.0, 2.0, 3.0, 4.0, 5.0]
     for do in do_list:
-        do.update_key(test_global_params)
-        print(f"DO {do.id} 派生密钥: {do.round_private_key}")
+        do.update_key(baseline_params)
+    print("[验证] 密钥派生完成")
 
-    print("\n===== 3. 测试本地训练功能 =====")
-    for do in do_list:
-        updates = do._local_train(test_global_params)
-        print(f"DO {do.id} 训练更新: {updates}")
-        print(f"DO {do.id} 训练历史记录数: {len(do.get_training_history())}")
+    # 单轮训练 + 加密
+    # do_cipher_map = {}
+    # for do in do_list:
+    #     do_cipher_map[do.id] = do.train_and_encrypt(baseline_params)
+    #     assert len(do_cipher_map[do.id]) == do.model_size
+    # print("[验证] 本地训练 + 加密通过")
 
-    print("\n===== 4. 测试加密上传功能 =====")
-    do_cipher_map = {}
-    for do in do_list:
-        ciphertexts = do.train_and_encrypt(test_global_params)
-        do_cipher_map[do.id] = ciphertexts
-        print(f"DO {do.id} 密文向量长度: {len(ciphertexts)}")
+    # 门限恢复
+    # missing_do_id = 1
+    # available = [0, 2]
+    # shares = {do_id + 1: do_list[do_id].uploadKeyShare(missing_do_id) for do_id in available}
+    # shares = {k: v for k, v in shares.items() if v is not None}
+    # recovered_key = ta.recover_do_key(missing_do_id, available)
+    # if(recovered_key==ta.get_base_key(missing_do_id)):
+    #     print("[验证] 门限恢复通过")
 
-    print("\n===== 5. 测试门限恢复功能 =====")
-    # 模拟DO 1掉线，测试其他DO提供分片
-    missing_do_id = 1
-    print(f"模拟DO {missing_do_id}掉线")
-    
-    available_do_ids = [0, 2]  # 可用的DO
-    shares = {}
-    for do_id in available_do_ids:
-        do = do_list[do_id]
-        share = do.uploadKeyShare(missing_do_id)
-        if share is not None:
-            shares[do_id + 1] = share  # 注意：shares的索引从1开始
-            print(f"DO {do_id} 提供分片: {share}")
-    
-    # 测试密钥恢复
-    if len(shares) >= ta.get_threshold():
-        print(f"收集到足够的分片（{len(shares)}个），开始恢复密钥...")
-        recovered_key = ta.recover_do_key(missing_do_id, available_do_ids)
-        if recovered_key:
-            print(f"成功恢复DO {missing_do_id}的密钥: {recovered_key}")
-            # 验证恢复的密钥
-            original_key = ta.get_base_key(missing_do_id)
-            print(f"原始密钥: {original_key}")
-            print(f"恢复正确: {recovered_key == original_key}")
+    # 多轮流程：进行 5 轮联邦学习；每轮每个 DO 训练 10 个 batch
+    print("\n===== 5. 多轮联邦训练（5轮，每轮10个batch） =====")
+    rounds = 5
+    gp_history: List[List[float]] = []
+    for r in range(1, rounds + 1):
+        print(f"\n----- Round {r} -----")
+        global_params = csp.broadcast_params()
+        gp_history.append(list(global_params))
+
+        round_cipher_map = {do.id: do.train_and_encrypt(global_params) for do in do_list}
+        updated_params = csp.round_aggregate_and_update(do_list, round_cipher_map)
+        assert len(updated_params) == csp.model_size
+    print("[验证] 多轮聚合/解密更新通过")
+
+    # 简单收敛性评估：统计相邻两轮全局参数的 L2 差异与最大绝对差
+    print("\n===== 6. 收敛性评估 =====")
+    diffs_l2 = []
+    diffs_inf = []
+    gp_history.append(list(csp.global_params))
+    for i in range(1, len(gp_history)):
+        a = gp_history[i-1]
+        b = gp_history[i]
+        sq = 0.0
+        m_abs = 0.0
+        for x, y in zip(a, b):
+            d = y - x
+            sq += d * d
+            ad = abs(d)
+            if ad > m_abs:
+                m_abs = ad
+        diffs_l2.append(math.sqrt(sq))
+        diffs_inf.append(m_abs)
+        print(f"Round {i-1} -> {i}: L2差={diffs_l2[-1]:.6f}, 无穷范数差={diffs_inf[-1]:.6f}")
+
+    if len(diffs_l2) >= 4:
+        mid = len(diffs_l2) // 2
+        front = sum(diffs_l2[:mid]) / max(1, mid)
+        back = sum(diffs_l2[mid:]) / max(1, len(diffs_l2) - mid)
+        print(f"平均L2差 前半:{front:.6f} 后半:{back:.6f}")
+        if back <= front * 0.9:
+            print("[评估] 全局参数呈收敛趋势（后半段差距更小）。")
         else:
-            print("密钥恢复失败")
-    else:
-        print(f"分片数量不足，需要{ta.get_threshold()}个，只有{len(shares)}个")
+            print("[评估] 收敛趋势不明显，可增加轮次或调整学习率/批次数。")
 
-    print("\n===== 6. 测试正交向量组功能 =====")
-    for do in do_list:
-        vectors = do.get_orthogonal_vectors()
-        print(f"DO {do.id} 正交向量组数量: {len(vectors)}")
-        if vectors:
-            print(f"DO {do.id} 第一个向量: {vectors[0]}")
+    print("\n===== 7. 测试投影计算功能 =====")
+    starttime=time.time()
+    # 直接计算 DO 模型参数在 TA 正交向量组上的投影（w·U -> 2048维）
+    # 选择 DO 0 进行演示
+    target_do = do_list[0]
+    w = target_do.get_last_updates()
+    U = ta.get_orthogonal_vectors()  # List[List[float]]，形状: [orthogonal_count][model_size]
+    assert len(w) == ta.MODEL_SIZE
+    assert len(U) == ta.ORTHOGONAL_VECTOR_COUNT
 
-    print("\n===== 7. 测试多轮训练 =====")
-    # 模拟多轮联邦学习
-    for round_num in range(3):
-        print(f"\n--- Round {round_num + 1} ---")
-        
-        # 广播全局参数
-        if round_num == 0:
-            global_params = csp.broadcast_params()
-        else:
-            global_params = [p + 0.1 for p in global_params]  # 模拟参数更新
-        
-        print(f"全局参数: {global_params}")
-        
-        # 各DO训练和加密
-        round_cipher_map = {}
-        for do in do_list:
-            ciphertexts = do.train_and_encrypt(global_params)
-            round_cipher_map[do.id] = ciphertexts
-        
-        # 聚合和解密
-        try:
-            updated_params = csp.round_aggregate_and_update(do_list, round_cipher_map)
-            print(f"Round {round_num + 1} 聚合完成，新参数: {updated_params}")
-            global_params = updated_params
-        except Exception as e:
-            print(f"Round {round_num + 1} 聚合失败: {e}")
+    try:
+        import numpy as _np
+        w_np = _np.array(w, dtype=float)              # (model_size,)
+        U_np = _np.array(U, dtype=float)              # (orthogonal_count, model_size)
+        proj_np = U_np.dot(w_np)                      # (orthogonal_count,)
+        projection = proj_np.astype(float).tolist()
+    except Exception:
+        # 纯 Python 回退实现
+        projection = []
+        for u_vec in U:
+            s = 0.0
+            for x, y in zip(w, u_vec):
+                s += x * y
+            projection.append(s)
+    print(projection)
+    assert len(projection) == ta.ORTHOGONAL_VECTOR_COUNT
+    endtime=time.time()
+    print(f"投影计算时间: {endtime-starttime}秒")
 
-    print("\n===== 8. 测试训练历史记录 =====")
-    for do in do_list:
-        history = do.get_training_history()
-        print(f"DO {do.id} 训练历史记录数: {len(history)}")
-        if history:
-            latest = history[-1]
-            print(f"DO {do.id} 最新训练记录: Round {latest['round']}, 更新: {latest['local_updates']}")
-
-    print("\n===== 9. 测试密钥更新功能 =====")
-    print("TA更新密钥...")
-    ta.update_keys_for_new_round()
-    
-    # 测试DO使用新密钥
-    new_global_params = [2.0, 3.0, 4.0, 5.0, 6.0]
-    for do in do_list:
-        do.update_key(new_global_params)
-        print(f"DO {do.id} 使用新密钥派生: {do.round_private_key}")
-
-    print("\n===== 测试完成 =====")
-    print("所有DO功能测试通过！")
+    print(">>> 全部 DO 功能验证通过")

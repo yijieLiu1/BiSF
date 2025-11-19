@@ -132,7 +132,7 @@ class SafeInnerProduct:
             E = (s_inv * D_sum) % p
             # handle negative numbers
             if E > p // 2:
-                print("溢出修正: E > p/2, subtracting p")
+                # print("溢出修正: E > p/2, subtracting p")
                 E -= p
             inner = (E - (E % alpha2)) // alpha2
             val = inner / (self.precision_factor * self.precision_factor)
