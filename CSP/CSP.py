@@ -33,7 +33,7 @@ class CSP:
 
         # 为掉线恢复缓存
         # 恢复的是掉线DO的n_i值
-        self.recoveredNiValues: Dict[int, int] = {}
+        self.recoveredSecretValues: Dict[int, int] = {}
 
         # 保存TA生成的正交向量组
         self.orthogonal_vectors_for_csp: List[List[float]] = []
@@ -94,7 +94,9 @@ class CSP:
 
     # ============== 收集/聚合 ==============
     def aggregate_ciphertexts(self, do_cipher_map: Dict[int, List[int]]) -> List[int]:
+        
         """逐坐标同态聚合：使用ImprovedPaillier的聚合方法"""
+        time_start = time.time()
         aggregated: List[int] = []
 
         for i in range(self.model_size):
@@ -110,14 +112,14 @@ class CSP:
                 # 加密0作为占位（使用 SK_DO = 1 即不会影响乘积）
                 zero_cipher = self.impaillier.encrypt(0.0, 1)
                 aggregated.append(zero_cipher)
-
-        print(f"[CSP] 聚合完成，共{len(aggregated)}个坐标")
+        time_end = time.time()
+        print(f"[CSP] 聚合完成，共{len(aggregated)}个坐标, 用时{time_end - time_start:.4f}秒")
         return aggregated
 
     # ============== 掉线恢复 ==============
     # 基于门限恢复缺失 n_i（从在线 DO 收集分片并重构）
     def recover_missing_private_keys(self, missing_ids: List[int], online_dos: List, threshold: int) -> Dict[int, int]:
-        self.recoveredNiValues.clear()
+        self.recoveredSecretValues.clear()
         print(f"[CSP] 检测到掉线 DO: {missing_ids}，在线DO: {[d.id for d in online_dos]}")
 
         for missing_id in missing_ids:
@@ -158,14 +160,14 @@ class CSP:
                     print(f"[CSP] 恢复DO {missing_id} 分片不足：{len(shares_map)}/{threshold}")
                     continue
 
-                recovered_n = recover_secret(shares_map, prime_used)
-                self.recoveredNiValues[missing_id] = recovered_n
-                print(f"[CSP] 成功恢复DO {missing_id} 的 n_i{recovered_n}")
+                recovered_key = recover_secret(shares_map, prime_used)
+                self.recoveredSecretValues[missing_id] = recovered_key
+                print(f"[CSP] 成功恢复DO {missing_id} 的私钥")
 
             except Exception as e:
                 print(f"[CSP] 恢复DO {missing_id} 时出错: {e}")
 
-        return self.recoveredNiValues
+        return self.recoveredSecretValues
 
     # ============== 解密流程（正常/带恢复） ==============
     def _decrypt_vector(self, aggregated: List[int]) -> List[float]:
@@ -182,13 +184,11 @@ class CSP:
         N2 = self.impaillier.N2
         N = self.impaillier.N
 
-        # 求和 n_i（由 TA 恢复并存入 self.recoveredNiValues）
-        sumNi = sum(self.recoveredNiValues.values())
-        sumNi = (sumNi * params_hash) % N  # 避免溢出
-
-        R_t = self.ta.get_R_t()
-        Rt_pow = pow(R_t, sumNi, N2)
-
+        # 连乘恢复的私钥（每个为 R_t^{n_i} mod N^2），得到 R_t^{sum n_i}
+        Rt_pow = 1
+        for secret in self.recoveredSecretValues.values():
+            Rt_pow = (Rt_pow * secret) % N2
+        Rt_pow = pow(Rt_pow, params_hash, N2)
         results: List[float] = [0.0] * self.model_size
         for i in range(self.model_size):
             modified = (aggregated[i] * Rt_pow) % N2
@@ -231,7 +231,14 @@ class CSP:
        
         self.debug_last_sum = list(summed)
         print(f"[CSP] 计算正交求和向量点积结果{self.compute_sum_with_orthogonal_vector(summed)}")
-        print(f"[CSP] 判断正交求和是否一致{self.compare_consistency(summed)}")
+        consistency = self.compare_consistency(summed)
+        print(f"[CSP] 判断正交求和是否一致{consistency}")
+        if not consistency:
+            suspects = self.locate_inconsistent_dos(do_list, do_cipher_map, params_hash)
+            if suspects:
+                print(f"[CSP] 二分定位可疑 DO: {suspects}")
+            else:
+                print("[CSP] 未能定位具体可疑 DO")
         print(f"[CSP] 解密后的聚合结果维度: {len(summed)}")
         print(f"[CSP] 聚合结果前10维: {summed[:10]}")
         print(f"[CSP] 聚合结果范围: [{min(summed):.4f}, {max(summed):.4f}]")
@@ -274,6 +281,69 @@ class CSP:
         is_consistent = abs(sum_wu - sum_proj) <= tol
         print(f"[CSP] 一致性判断: {is_consistent}")
         return is_consistent
+
+    def _subset_projection_sum(self, subset_ids: List[int]) -> Optional[float]:
+        if not self.do_projection_map:
+            return None
+        total = 0.0
+        for do_id in subset_ids:
+            vec = self.do_projection_map.get(do_id)
+            if vec:
+                total += float(sum(vec))
+        return total
+
+    def _decrypt_vector_quiet(self, cipher_vec: List[int]) -> List[float]:
+        return [self.impaillier.decrypt(val) for val in cipher_vec]
+
+    def _subset_consistency(self, subset_ids: List[int], do_cipher_map: Dict[int, List[int]], params_hash: int,
+                             tol: float = 1e-2) -> bool:
+        if not subset_ids:
+            return True
+        subset_map = {do_id: do_cipher_map[do_id] for do_id in subset_ids if do_id in do_cipher_map}
+        if not subset_map:
+            return True
+
+        aggregated = self.aggregate_ciphertexts(subset_map)
+        complement_ids = [do_id for do_id in do_cipher_map.keys() if do_id not in subset_ids]
+        comp_key = self.ta.get_aggregated_base_key(complement_ids) if complement_ids else 1
+        if comp_key in (None, 0):
+            Rt_pow = 1
+        else:
+            Rt_pow = pow(comp_key, params_hash, self.impaillier.N2)
+        modified = [(val * Rt_pow) % self.impaillier.N2 for val in aggregated]
+        summed = self._decrypt_vector_quiet(modified)
+        subset_proj = self._subset_projection_sum(subset_ids)
+        if subset_proj is None:
+            return True
+        sum_proj = self.compute_sum_with_orthogonal_vector(summed)
+        is_consistent = abs(subset_proj - sum_proj) <= tol
+        if not is_consistent:
+            print(f"[CSP] 子集 {subset_ids} 不一致：w·U={subset_proj}, 解密投影={sum_proj}")
+        return is_consistent
+
+    def _bisect_inconsistency(self, do_ids: List[int], do_cipher_map: Dict[int, List[int]], params_hash: int,
+                              tol: float = 1e-2) -> List[int]:
+        if not do_ids:
+            return []
+        if len(do_ids) == 1:
+            return do_ids
+        mid = len(do_ids) // 2
+        left = do_ids[:mid]
+        right = do_ids[mid:]
+        if not self._subset_consistency(left, do_cipher_map, params_hash, tol):
+            return self._bisect_inconsistency(left, do_cipher_map, params_hash, tol)
+        if not self._subset_consistency(right, do_cipher_map, params_hash, tol):
+            return self._bisect_inconsistency(right, do_cipher_map, params_hash, tol)
+        return []
+
+    def locate_inconsistent_dos(self, do_list: List[Optional[object]], do_cipher_map: Dict[int, List[int]],
+                                params_hash: int, tol: float = 1e-2) -> List[int]:
+        print(f"\n[CSP] 开始二分定位不一致 DO")
+        active_ids = [d.id for d in do_list if d is not None]
+        if len(active_ids) <= 1 or not self.do_projection_map:
+            return active_ids
+        suspects = self._bisect_inconsistency(active_ids, do_cipher_map, params_hash, tol)
+        return suspects
 
     # ============== 投毒检测：Multi-Krum 风格 ==============
     def detect_poison_multi_krum(self, f: int = 1, alpha: float = 1.5) -> List[int]:
@@ -349,7 +419,7 @@ class CSP:
 
         print(f"[CSP] Multi-Krum 检测：scores={scores}, med={med:.6f}, iqr={iqr:.6f}, 阈值={threshold:.6f}")
         if suspects:
-            print(f"[CSP] 可疑 DO: {suspects}")
+            print(f"[CSP] Multi-Krum 可疑 DO: {suspects}")
         else:
             print("[CSP] 未发现可疑 DO（根据当前阈值）。")
         return suspects
@@ -442,6 +512,187 @@ class CSP:
             print(f"[CSP] GeoMedian 可疑 DO: {suspects}")
         else:
             print("[CSP] GeoMedian 未发现可疑 DO（根据当前阈值）。")
+        return suspects
+
+    def detect_poison_clustering(self, k: int = 2, max_iter: int = 10, alpha: float = 1.5) -> List[int]:
+        """
+        简易聚类式防御：用 k-means 将投影向量聚类，丢弃离群簇。
+        """
+        if not self.do_projection_map or k < 1:
+            print("[CSP] Cluster 检测跳过：无投影数据或 k 无效。")
+            return []
+
+        ids = sorted(self.do_projection_map.keys())
+        vectors = [self.do_projection_map[i] for i in ids]
+        n = len(vectors)
+        if n <= 1:
+            return []
+        dim = len(vectors[0])
+        k = min(k, n)
+
+        # 初始化中心
+        centers = [vectors[i][:] for i in range(k)]
+        assignments = [0] * n
+
+        def dist_sq(a, b):
+            return sum((x - y) ** 2 for x, y in zip(a, b))
+
+        for _ in range(max_iter):
+            changed = False
+            for idx, vec in enumerate(vectors):
+                dists = [dist_sq(vec, c) for c in centers]
+                new_k = min(range(k), key=lambda i: dists[i])
+                if assignments[idx] != new_k:
+                    assignments[idx] = new_k
+                    changed = True
+            if not changed:
+                break
+            # 更新中心
+            counts = [0] * k
+            sums = [[0.0] * dim for _ in range(k)]
+            for assign, vec in zip(assignments, vectors):
+                counts[assign] += 1
+                for j in range(dim):
+                    sums[assign][j] += vec[j]
+            for i in range(k):
+                if counts[i] == 0:
+                    centers[i] = vectors[_ % n][:]  # fallback
+                else:
+                    centers[i] = [s / counts[i] for s in sums[i]]
+
+        # 全局中心
+        overall = [0.0] * dim
+        for vec in vectors:
+            for j, val in enumerate(vec):
+                overall[j] += val
+        overall = [v / n for v in overall]
+
+        # 计算簇得分：距离 * (n/size)
+        scores = []
+        for i in range(k):
+            size = sum(1 for a in assignments if a == i)
+            if size == 0:
+                scores.append(float('inf'))
+                continue
+            d = math.sqrt(dist_sq(centers[i], overall))
+            score = d * (n / size)
+            scores.append(score)
+
+        def _median(vals: List[float]) -> float:
+            vals_sorted = sorted(vals)
+            m = len(vals_sorted)
+            mid = m // 2
+            if m % 2:
+                return vals_sorted[mid]
+            return 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+
+        def _iqr(vals: List[float]) -> float:
+            if len(vals) < 4:
+                return 0.0
+            vals_sorted = sorted(vals)
+            m = len(vals_sorted)
+            mid = m // 2
+            lower = vals_sorted[:mid]
+            upper = vals_sorted[mid + (0 if m % 2 == 0 else 1):]
+            if not lower or not upper:
+                return 0.0
+            return _median(upper) - _median(lower)
+
+        med = _median(scores)
+        iqr = _iqr(scores)
+        threshold = med + alpha * iqr
+        suspect_clusters = [i for i, sc in enumerate(scores) if sc > threshold]
+        suspects = [ids[idx] for idx, c in enumerate(assignments) if c in suspect_clusters]
+        print(f"[CSP] Cluster 检测：scores={scores}, 阈值={threshold:.6f}")
+        if suspects:
+            print(f"[CSP] Cluster 可疑 DO: {suspects}")
+        else:
+            print("[CSP] Cluster 未发现可疑 DO（根据当前阈值）。")
+        return suspects
+
+    def detect_poison_lasa_lite(self, angle_threshold: float = 0.0, beta: float = 1.5) -> List[int]:
+        """
+        LASA-lite风格检测：方向和模长双重检查。
+        angle_threshold 为参考方向的余弦相似度阈值（越大越严格）。
+        """
+        if not self.do_projection_map:
+            print("[CSP] LASA-lite 检测跳过：无投影数据。")
+            return []
+
+        ids = sorted(self.do_projection_map.keys())
+        vectors = [self.do_projection_map[i] for i in ids]
+        n = len(vectors)
+        if n == 0:
+            return []
+        dim = len(vectors[0])
+
+        def norm(vec):
+            return math.sqrt(sum(x * x for x in vec))
+
+        # 方向标准化
+        norm_dirs = []
+        lengths = []
+        for vec in vectors:
+            length = norm(vec)
+            lengths.append(length)
+            if length == 0:
+                norm_dirs.append([0.0] * dim)
+            else:
+                norm_dirs.append([x / length for x in vec])
+
+        # 参考方向（归一化方向的平均）
+        ref = [0.0] * dim
+        for dir_vec in norm_dirs:
+            for j, val in enumerate(dir_vec):
+                ref[j] += val
+        ref_norm = norm(ref)
+        if ref_norm == 0:
+            print("[CSP] LASA-lite 参考方向无效，跳过检测。")
+            return []
+        ref = [x / ref_norm for x in ref]
+
+        # 余弦相似度
+        cos_sims = []
+        for dir_vec in norm_dirs:
+            cos_sims.append(sum(a * b for a, b in zip(dir_vec, ref)))
+
+        # 模长阈值
+        def _median(vals: List[float]) -> float:
+            vals_sorted = sorted(vals)
+            m = len(vals_sorted)
+            mid = m // 2
+            if m % 2:
+                return vals_sorted[mid]
+            return 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
+
+        def _iqr(vals: List[float]) -> float:
+            if len(vals) < 4:
+                return 0.0
+            vals_sorted = sorted(vals)
+            m = len(vals_sorted)
+            mid = m // 2
+            lower = vals_sorted[:mid]
+            upper = vals_sorted[mid + (0 if m % 2 == 0 else 1):]
+            if not lower or not upper:
+                return 0.0
+            return _median(upper) - _median(lower)
+
+        med_len = _median(lengths)
+        iqr_len = _iqr(lengths)
+        upper = med_len + beta * iqr_len
+        lower = med_len - beta * iqr_len
+
+        suspects = []
+        for do_id, cos_sim, length in zip(ids, cos_sims, lengths):
+            direction_bad = cos_sim < angle_threshold
+            magnitude_bad = (length > upper) or (length < max(0.0, lower))
+            if direction_bad and magnitude_bad:
+                suspects.append(do_id)
+        print(f"[CSP] LASA-lite 检测：angle阈值={angle_threshold}, len阈值=[{lower:.3f}, {upper:.3f}]")
+        if suspects:
+            print(f"[CSP] LASA-lite 可疑 DO: {suspects}")
+        else:
+            print("[CSP] LASA-lite 未发现可疑 DO（根据当前阈值）。")
         return suspects
 
     # ============== SafeMul: 1+3轮（PA侧） ==============
@@ -538,14 +789,14 @@ if __name__ == "__main__":
     if safe_scalar_round1 is not None:
         print(f"[DEBUG R1] SafeMul 投影标量求和: {safe_scalar_round1}")
 
-    # print("\n===== Round 2: 模拟 DO2 掉线并恢复 =====")
-    # global_params = csp.broadcast_params()
-    # do_list[2] = None  # 模拟掉线
+    print("\n===== Round 2: 模拟 DO2 掉线并恢复 =====")
+    global_params = csp.broadcast_params()
+    do_list[2] = None  # 模拟掉线
 
-    # do_cipher_map = {}
-    # for do in [d for d in do_list if d is not None]:
-    #     ciphertexts = do.train_and_encrypt(global_params)
-    #     do_cipher_map[do.id] = ciphertexts
+    do_cipher_map = {}
+    for do in [d for d in do_list if d is not None]:
+        ciphertexts = do.train_and_encrypt(global_params)
+        do_cipher_map[do.id] = ciphertexts
 
     # print("\n===== Round 2: SafeMul 投影计算（在线 DO）====")
     # csp.do_projection_map.clear()

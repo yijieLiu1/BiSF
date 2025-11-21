@@ -203,28 +203,33 @@ class TA:
             precision=self.precision
         )
 
-        # 2. 从 impaillier 同步必要参数
+        # 2. 与 impaillier 同步必要参数
+
         self.N = self.impaillier.getN()
+
         self.g = self.impaillier.g
+
         self.h = self.impaillier.h
+
         self.lambda_val = self.impaillier.lambda_
+
         self.u = self.impaillier.u
-        self.gamma = self.impaillier.y  # 同步y参数到gamma
+
+        self.gamma = self.impaillier.y  # 同步 y 参数到 gamma
+
         self.R_t = self.impaillier.R_t
+
         self.n_i = self.impaillier.n_i
+
         self.do_private_keys = {i: sk for i, sk in enumerate(self.impaillier.SK_DO)}
 
-        # 3. 保持门限秘密分享逻辑不变
-        for i in range(self.num_do):
-            try:
-                shares, prime_used = split_secret(self.n_i[i], self.threshold, self.num_do)
 
-            except Exception as e:
-                raise RuntimeError(f"DO {i} 的秘密分享失败: {e}")
 
-            distributed = {j: shares[j + 1] for j in range(self.num_do) if j != i}
-            #获取秘密分享值，还有使用的素数值"prime"
-            self.do_key_shares[i] = {'shares': distributed, 'prime': prime_used}
+        # 3. 根据当前私钥生成门限秘密分享
+
+        self._generate_key_shares()
+
+
 
         # 4. 保存密钥快照
         self._save_key_info()
@@ -239,6 +244,32 @@ class TA:
             'timestamp': secrets.randbits(64)  # 简单的时间戳
         }
         self.key_history.append(key_info)
+
+    def _generate_key_shares(self) -> None:
+        """根据当前 DO 私钥生成门限秘密分享"""
+        self.do_key_shares = {}
+        for i in range(self.num_do):
+            try:
+                shares, prime_used = split_secret(self.do_private_keys[i], self.threshold, self.num_do)
+            except Exception as e:
+                raise RuntimeError(f"DO {i} 的秘密分享失败: {e}")
+
+            distributed = {j: shares[j + 1] for j in range(self.num_do) if j != i}
+            self.do_key_shares[i] = {'shares': distributed, 'prime': prime_used}
+
+    def get_aggregated_base_key(self, do_ids: List[int]) -> int:
+        """
+        返回指定 DO 集合的基础私钥乘积（mod N^2），用于补偿缺失 DO。
+        空集合返回 1。
+        """
+        N_sq = self.N * self.N
+        result = 1
+        for do_id in do_ids:
+            sk = self.do_private_keys.get(do_id)
+            if sk is None:
+                continue
+            result = (result * sk) % N_sq
+        return result
 
     # ---------- 密钥更新功能 ----------
     def update_keys_for_new_round(self) -> None:
@@ -258,6 +289,8 @@ class TA:
         
         # 重新计算所有DO的私钥
         self._update_do_private_keys()
+        # 并基于新私钥刷新门限秘密分享
+        self._generate_key_shares()
 
         # 每轮刷新正交向量组，并重新拆分给 CSP 与 DO
         # 防止各轮使用同一组向量影响投毒检测的鲁棒性
@@ -305,16 +338,13 @@ class TA:
         try:
             # 选择足够的shares进行恢复
             selected_shares = dict(list(available_shares.items())[:self.threshold])
-            recovered_n = recover_secret(selected_shares, shares_info['prime'])
+            recovered_key = recover_secret(selected_shares, shares_info['prime'])
             
-            # 验证恢复的n_i是否正确
-            if recovered_n == self.n_i[do_id]:
-                # 计算恢复的私钥
-                N_sq = self.N * self.N
-                recovered_key = pow(self.R_t, recovered_n, N_sq)
+            # 验证恢复的私钥是否正确
+            if recovered_key == self.do_private_keys.get(do_id):
                 return recovered_key
             else:
-                print(f"恢复的n_{do_id}不正确")
+                print(f"恢复的DO {do_id} 私钥不正确")
                 return None
         except Exception as e:
             print(f"恢复DO {do_id}的密钥失败: {e}")
@@ -352,7 +382,7 @@ class TA:
 # ----------------- 测试 -----------------
 if __name__ == "__main__":
     print("初始化TA（5个DO）...")
-    ta = TA(num_do=5, model_size=50000, orthogonal_vector_count=2048, bit_length=512)
+    ta = TA(num_do=3, model_size=10000, orthogonal_vector_count=1024, bit_length=512)
 
     print("\n=== 全局参数 ===")
     print("N:", ta.get_N())
@@ -394,7 +424,7 @@ if __name__ == "__main__":
 
     recovered_n = recover_secret(used_shares, prime_used)
     print(f"恢复出的 n_{missing_do}: {recovered_n}")
-    print(f"原始 n_{missing_do}: {ta.get_ni(missing_do)}, 恢复是否正确: {recovered_n == ta.get_ni(missing_do)}")
+    print(f"原始 n_{missing_do}: {ta.get_base_key(missing_do)}, 恢复是否正确: {recovered_n ==ta.get_base_key(missing_do)}")
 
     print("\n=== 测试密钥更新功能 ===")
     print("第0轮密钥信息:")
