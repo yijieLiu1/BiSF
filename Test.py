@@ -13,7 +13,8 @@ import time
 import random
 import math
 from typing import Dict, List, Optional
-
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
 from TA.TA import TA
@@ -48,6 +49,45 @@ def run_federated_simulation(
         dropouts = dict(dropouts)
         dropouts[dropout_round] = dropout_do_ids
     _rng = random.Random(2025)
+
+    def _vector_gap(new_vec: List[float], old_vec: List[float]) -> Dict[str, float]:
+        if not new_vec or not old_vec:
+            return {"l2": 0.0, "linf": 0.0}
+        l2_sq = 0.0
+        linf = 0.0
+        for x, y in zip(new_vec, old_vec):
+            d = x - y
+            l2_sq += d * d
+            ad = abs(d)
+            if ad > linf:
+                linf = ad
+        return {"l2": math.sqrt(l2_sq), "linf": linf}
+
+    def _vector_cos(new_vec: List[float], old_vec: List[float]) -> float:
+        if not new_vec or not old_vec:
+            return 0.0
+        num = 0.0
+        n_norm_sq = 0.0
+        o_norm_sq = 0.0
+        for x, y in zip(new_vec, old_vec):
+            num += x * y
+            n_norm_sq += x * x
+            o_norm_sq += y * y
+        if n_norm_sq == 0.0 or o_norm_sq == 0.0:
+            return 0.0
+        return num / (math.sqrt(n_norm_sq) * math.sqrt(o_norm_sq))
+
+    def _vector_summary(vec: List[float]) -> Dict[str, float]:
+        if not vec:
+            return {"mean": 0.0, "abs_max": 0.0}
+        total = 0.0
+        abs_max = 0.0
+        for v in vec:
+            total += v
+            av = abs(v)
+            if av > abs_max:
+                abs_max = av
+        return {"mean": total / len(vec), "abs_max": abs_max}
 
     print("===== 初始化 TA / CSP / DO 列表 =====")
     ta = TA(
@@ -174,16 +214,29 @@ def run_federated_simulation(
         updated_params = csp.round_aggregate_and_update(working_do_list, do_cipher_map)
         print(f"[Round {round_idx}] 更新后的全局参数前5: {updated_params[:5]}")
 
+        # 训练效果评估（无测试集版本）：看参数值收敛性
+        gap = _vector_gap(updated_params, global_params)
+        summary = _vector_summary(updated_params)
+        cos = _vector_cos(updated_params, global_params)
+        print(
+            f"[Round {round_idx}] 参数变化: ΔL2={gap['l2']:.6f}, Δ∞={gap['linf']:.6f}, cos(prev)={cos:.6f}; "
+            f"当前均值={summary['mean']:.6f}, |max|={summary['abs_max']:.6f}"
+        )
+
     print("\n===== 全部轮次结束 =====")
     print(f"最终全局参数前5: {csp.global_params[:5]}")
+    final_summary = _vector_summary(csp.global_params)
+    print(
+        f"最终参数统计: 均值={final_summary['mean']:.6f}, |max|={final_summary['abs_max']:.6f}"
+    )
 
 
 if __name__ == "__main__":
     # 示例：2 轮，5 个 DO；第 2 轮让 DO2 掉线，DO1 做 Lie Attack（放大 1.2）
     run_federated_simulation(
         num_rounds=2,
-        num_do=30,
-        model_size=10_000,
+        num_do=5,
+        model_size=50000,
         orthogonal_vector_count=1_024,
         bit_length=512,
         precision=10 ** 6,
@@ -191,5 +244,5 @@ if __name__ == "__main__":
         # dropouts={1: [2]},
         attack_round=1,
         attack_do_id=4,
-        attack_lambda=0.2,
+        attack_lambda=0.4,
     )

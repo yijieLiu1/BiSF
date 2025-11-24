@@ -120,21 +120,21 @@ class DO:
     class _SimpleMNISTCNN(nn.Module):
         def __init__(self):
             super().__init__()
-            self.conv1 = nn.Conv2d(1, 32, 3, 1)
-            self.conv2 = nn.Conv2d(32, 64, 3, 1)
-            self.dropout1 = nn.Dropout(0.25)
-            self.dropout2 = nn.Dropout(0.5)
-            self.fc1 = nn.Linear(9216, 128)
-            self.fc2 = nn.Linear(128, 10)
+            # 中等规模 CNN，参数量约 5.7 万（接近 6 万）
+            self.conv1 = nn.Conv2d(1, 16, 3, 1)    # 1*3*3*16 + 16 ≈ 160
+            self.conv2 = nn.Conv2d(16, 32, 3, 1)   # 16*3*3*32 + 32 ≈ 4.6k
+            self.pool = nn.MaxPool2d(2)
+            # 输入 28x28：conv->pool->conv->pool -> 32×5×5 = 800
+            self.fc1 = nn.Linear(32 * 5 * 5, 64)   # 800*64 + 64 ≈ 51.2k
+            self.fc2 = nn.Linear(64, 10)           # 64*10 + 10 ≈ 650
 
         def forward(self, x):
             x = F.relu(self.conv1(x))
+            x = self.pool(x)
             x = F.relu(self.conv2(x))
-            x = F.max_pool2d(x, 2)
-            x = self.dropout1(x)
+            x = self.pool(x)
             x = torch.flatten(x, 1)
             x = F.relu(self.fc1(x))
-            x = self.dropout2(x)
             x = self.fc2(x)
             return x
 
@@ -308,6 +308,7 @@ class DO:
         print(f"[DO {self.id}] CNN本地训练完成，使用批次数: {batches_processed}")
 
         # Flatten parameters并映射到指定维度
+        print(f"[DO {self.id}] 提取并扁平化模型参数...，原始参数大小为 {sum(p.numel() for p in model.parameters())}维")
         local_params_raw = self._flatten_model_parameters(model)
         local_params = self._project_params_to_model_size(local_params_raw)
 
