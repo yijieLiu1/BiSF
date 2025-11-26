@@ -98,75 +98,138 @@ class TA:
     def _lcm(self, a: int, b: int) -> int:
         return a // math.gcd(a, b) * b
 
-    # ---------- 正交向量 ----------
+    # ---------- 正交向量 SuperBitLSH,分block思想----------
+    # def _generate_orthogonal_vectors(self) -> None:
+    #     print(f"TA开始生成正交向量组{self.MODEL_SIZE}*{self.ORTHOGONAL_VECTOR_COUNT}")
+    #     t1 = time.time()
+
+    #     if not _NP_AVAILABLE:
+    #         raise RuntimeError("NumPy is required for _generate_orthogonal_vectors in this implementation.")
+
+    #     # 以轮次和 R_t 混合的安全随机数作为种子，确保每轮不同
+    #     try:
+    #         mix = (self.current_round + 1) ^ (self.R_t if isinstance(self.R_t, int) else 0)
+    #     except Exception:
+    #         mix = (self.current_round + 1)
+    #     seed = int.from_bytes(secrets.token_bytes(16), 'big') ^ mix
+
+    #     # ---------------- SuperBit 参数 ----------------
+    #     d = self.MODEL_SIZE
+    #     K = self.ORTHOGONAL_VECTOR_COUNT
+
+    #     # 如果类里有 SUPERBIT_DEPTH，就用它；否则退化为 N = min(d, K)
+    #     if hasattr(self, "SUPERBIT_DEPTH") and isinstance(self.SUPERBIT_DEPTH, int) and self.SUPERBIT_DEPTH > 0:
+    #         N = min(self.SUPERBIT_DEPTH, d, K)
+    #     else:
+    #         N = min(d, K)
+
+    # # ---------------- 使用 NumPy 实现 SuperBit 式分批正交化 ----------------
+    #     rnd = np.random.default_rng(seed)
+
+    # # 生成 d × K 的高斯随机矩阵
+    #     A = rnd.standard_normal(size=(d, K))
+
+    # # 列归一化（可选，但更贴近 SuperBit 论文的 Algorithm 1）
+    #     col_norms = np.linalg.norm(A, axis=0, keepdims=True)
+    #     col_norms[col_norms == 0.0] = 1.0
+    #     A = A / col_norms
+
+    # # orth_mat 最终存放 d × K 的列正交矩阵
+    #     orth_mat = np.zeros_like(A, dtype=float)
+
+    # # 按 SuperBit 深度 N 分批，对每一批做 QR 正交化
+    # # 同一批内部向量正交，不同批之间不强求正交 —— 这正是 SuperBit 的设计
+    #     for start in range(0, K, N):
+    #         end = min(start + N, K)
+    #         block = A[:, start:end]  # d × (end-start)
+    #         Q_block, _ = np.linalg.qr(block, mode='reduced')
+    #     # Q_block 形状为 d × r，r = end-start（或更小），我们只取前 (end-start) 列
+    #         r = min(Q_block.shape[1], end - start)
+    #         orth_mat[:, start:start + r] = Q_block[:, :r]
+
+    # # 转为 list[list[float]]，每个向量长度为 MODEL_SIZE
+    #     self.orthogonal_vectors = [orth_mat[:, i].astype(float).tolist() for i in range(K)]
+
+    #     print(f"生成的正交向量组：共{len(self.orthogonal_vectors)}个向量，每个向量{self.MODEL_SIZE}维")
+    #     for i in range(min(3, len(self.orthogonal_vectors))):
+    #         vec_preview = self.orthogonal_vectors[i][:5]
+    #         print(f"向量{i}前5维: {vec_preview}...")
+
+    # # ---------------- 以下逻辑保持不变：CSP/DO 分配向量 + 求和向量 ----------------
+    # # 使用同一个 seed 的变体生成 [0,1) 权重
+    #     ratios = np.random.default_rng(seed ^ 0xABCDEF).random(
+    #         size=(self.ORTHOGONAL_VECTOR_COUNT, self.MODEL_SIZE)
+    #     )
+    #     U_np = np.array(self.orthogonal_vectors, dtype=float)  # 形状 (K, d)
+    #     csp_np = U_np * ratios
+    #     do_np = U_np * (1.0 - ratios)
+    #     self.orthogonal_vectors_for_csp = [row.tolist() for row in csp_np]
+    #     self.orthogonal_vectors_for_do = [row.tolist() for row in do_np]
+
+    # # 生成 CSP 使用的求和向量（按列求和，得到长度为 MODEL_SIZE 的列向量）
+    #     if self.orthogonal_vectors_for_csp:
+    #         self.orthogonal_sumvectors_for_csp = [
+    #             float(sum(col)) for col in zip(*self.orthogonal_vectors)
+    #         ]
+    #     else:
+    #         self.orthogonal_sumvectors_for_csp = [0.0] * self.MODEL_SIZE
+
+    #     t2 = time.time()
+    #     print(f"TA生成正交向量组{self.MODEL_SIZE}*{self.ORTHOGONAL_VECTOR_COUNT}共用时{t2 - t1}s")
+        # ---------- 全局正交向量 ----------
     def _generate_orthogonal_vectors(self) -> None:
-        print(f"TA开始生成正交向量组{self.MODEL_SIZE}*{self.ORTHOGONAL_VECTOR_COUNT}")
+        print(f"TA开始生成正交向量组（全局正交） {self.MODEL_SIZE}×{self.ORTHOGONAL_VECTOR_COUNT}")
         t1 = time.time()
 
         if not _NP_AVAILABLE:
-            raise RuntimeError("NumPy is required for _generate_orthogonal_vectors in this implementation.")
+            raise RuntimeError("NumPy is required for _generate_orthogonal_vectors.")
 
-        # 以轮次和 R_t 混合的安全随机数作为种子，确保每轮不同
+        # ================ 随机种子（尽量保持与原逻辑一致） ================
         try:
             mix = (self.current_round + 1) ^ (self.R_t if isinstance(self.R_t, int) else 0)
         except Exception:
             mix = (self.current_round + 1)
         seed = int.from_bytes(secrets.token_bytes(16), 'big') ^ mix
 
-        # ---------------- SuperBit 参数 ----------------
         d = self.MODEL_SIZE
-        K = self.ORTHOGONAL_VECTOR_COUNT
+        k = self.ORTHOGONAL_VECTOR_COUNT
+        rng = np.random.default_rng(seed)
 
-        # 如果类里有 SUPERBIT_DEPTH，就用它；否则退化为 N = min(d, K)
-        if hasattr(self, "SUPERBIT_DEPTH") and isinstance(self.SUPERBIT_DEPTH, int) and self.SUPERBIT_DEPTH > 0:
-            N = min(self.SUPERBIT_DEPTH, d, K)
-        else:
-            N = min(d, K)
+        # ================================================================
+        #                 【全局正交化】Global Orthogonal QR
+        # ================================================================
+        # 生成 d×k 的高斯矩阵（d 可非常大，例如 60000）
+        A = rng.standard_normal(size=(d, k))
 
-    # ---------------- 使用 NumPy 实现 SuperBit 式分批正交化 ----------------
-        rnd = np.random.default_rng(seed)
+        # 进行 QR 分解获得全局正交基（Q 的每列都两两正交）
+        # Q 形状：d×k
+        Q, _ = np.linalg.qr(A, mode="reduced")
 
-    # 生成 d × K 的高斯随机矩阵
-        A = rnd.standard_normal(size=(d, K))
+        # 保存为 list[list[float]]，与原来保持一致
+        self.orthogonal_vectors = [Q[:, i].astype(float).tolist() for i in range(k)]
 
-    # 列归一化（可选，但更贴近 SuperBit 论文的 Algorithm 1）
-        col_norms = np.linalg.norm(A, axis=0, keepdims=True)
-        col_norms[col_norms == 0.0] = 1.0
-        A = A / col_norms
-
-    # orth_mat 最终存放 d × K 的列正交矩阵
-        orth_mat = np.zeros_like(A, dtype=float)
-
-    # 按 SuperBit 深度 N 分批，对每一批做 QR 正交化
-    # 同一批内部向量正交，不同批之间不强求正交 —— 这正是 SuperBit 的设计
-        for start in range(0, K, N):
-            end = min(start + N, K)
-            block = A[:, start:end]  # d × (end-start)
-            Q_block, _ = np.linalg.qr(block, mode='reduced')
-        # Q_block 形状为 d × r，r = end-start（或更小），我们只取前 (end-start) 列
-            r = min(Q_block.shape[1], end - start)
-            orth_mat[:, start:start + r] = Q_block[:, :r]
-
-    # 转为 list[list[float]]，每个向量长度为 MODEL_SIZE
-        self.orthogonal_vectors = [orth_mat[:, i].astype(float).tolist() for i in range(K)]
-
-        print(f"生成的正交向量组：共{len(self.orthogonal_vectors)}个向量，每个向量{self.MODEL_SIZE}维")
+        print(f"生成的全局正交向量：共{len(self.orthogonal_vectors)}个，每个向量{self.MODEL_SIZE}维")
         for i in range(min(3, len(self.orthogonal_vectors))):
-            vec_preview = self.orthogonal_vectors[i][:5]
-            print(f"向量{i}前5维: {vec_preview}...")
+            print(f"向量{i}前5维: {self.orthogonal_vectors[i][:5]}...")
 
-    # ---------------- 以下逻辑保持不变：CSP/DO 分配向量 + 求和向量 ----------------
-    # 使用同一个 seed 的变体生成 [0,1) 权重
+        # ================================================================
+        #             以下逻辑保持不变 —— CSP / DO 分配向量
+        # ================================================================
+        # 使用 seed 的变体生成 [0,1) ratio
         ratios = np.random.default_rng(seed ^ 0xABCDEF).random(
-            size=(self.ORTHOGONAL_VECTOR_COUNT, self.MODEL_SIZE)
+            size=(k, d)
         )
-        U_np = np.array(self.orthogonal_vectors, dtype=float)  # 形状 (K, d)
+
+        U_np = np.array(self.orthogonal_vectors, dtype=float)  # (k, d)
         csp_np = U_np * ratios
         do_np = U_np * (1.0 - ratios)
-        self.orthogonal_vectors_for_csp = [row.tolist() for row in csp_np]
-        self.orthogonal_vectors_for_do = [row.tolist() for row in do_np]
 
-    # 生成 CSP 使用的求和向量（按列求和，得到长度为 MODEL_SIZE 的列向量）
+        self.orthogonal_vectors_for_csp = [row.tolist() for row in csp_np]
+        self.orthogonal_vectors_for_do  = [row.tolist() for row in do_np]
+
+        # ================================================================
+        #            生成 CSP 使用的求和向量（保持原逻辑）
+        # ================================================================
         if self.orthogonal_vectors_for_csp:
             self.orthogonal_sumvectors_for_csp = [
                 float(sum(col)) for col in zip(*self.orthogonal_vectors)
@@ -175,7 +238,8 @@ class TA:
             self.orthogonal_sumvectors_for_csp = [0.0] * self.MODEL_SIZE
 
         t2 = time.time()
-        print(f"TA生成正交向量组{self.MODEL_SIZE}*{self.ORTHOGONAL_VECTOR_COUNT}共用时{t2 - t1}s")
+        print(f"TA生成正交向量组共用时 {t2 - t1:.4f}s（全局正交模式）")
+
 
     def _check_orthogonality(self) -> None:
         # 对于大维度向量，只检查前几对向量的正交性，避免计算量过大

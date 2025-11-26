@@ -12,6 +12,7 @@ import sys
 import time
 import random
 import math
+import json
 from typing import Dict, List, Optional
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -99,6 +100,7 @@ def run_federated_simulation(
     )
     csp = CSP(ta, model_size=model_size, precision=precision)
     do_list: List[Optional[DO]] = [DO(i, ta, model_size=model_size, precision=precision) for i in range(num_do)]
+    round_stats: List[Dict[str, float]] = []
 
     def run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> None:
         if not vector_map:
@@ -222,6 +224,17 @@ def run_federated_simulation(
             f"[Round {round_idx}] 参数变化: ΔL2={gap['l2']:.6f}, Δ∞={gap['linf']:.6f}, cos(prev)={cos:.6f}; "
             f"当前均值={summary['mean']:.6f}, |max|={summary['abs_max']:.6f}"
         )
+        # 记录本轮统计（proxy_loss 用 ΔL2 平均化作为无数据集的收敛近似指标）
+        proxy_loss = (gap['l2'] ** 2) / max(1, len(updated_params))
+        round_stats.append({
+            "round": round_idx,
+            "delta_l2": gap['l2'],
+            "delta_inf": gap['linf'],
+            "cos": cos,
+            "mean": summary['mean'],
+            "abs_max": summary['abs_max'],
+            "proxy_loss": proxy_loss,
+        })
 
     print("\n===== 全部轮次结束 =====")
     print(f"最终全局参数前5: {csp.global_params[:5]}")
@@ -229,14 +242,32 @@ def run_federated_simulation(
     print(
         f"最终参数统计: 均值={final_summary['mean']:.6f}, |max|={final_summary['abs_max']:.6f}"
     )
+    # 保存最终全局参数
+    try:
+        os.makedirs("trainResult", exist_ok=True)
+        result_path = os.path.join("trainResult", f"global_params_round{num_rounds}.json")
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump({"rounds": num_rounds, "model_size": len(csp.global_params), "params": csp.global_params}, f)
+        print(f"全局参数已保存至: {result_path}")
+    except Exception as e:
+        print(f"保存全局参数失败: {e}")
+    # 汇总各轮指标
+    if round_stats:
+        print("\n===== 训练指标汇总（逐轮） =====")
+        for stat in round_stats:
+            print(
+                f"Round {stat['round']}: ΔL2={stat['delta_l2']:.6f}, Δ∞={stat['delta_inf']:.6f}, "
+                f"cos(prev)={stat['cos']:.6f}, 均值={stat['mean']:.6f}, |max|={stat['abs_max']:.6f}, "
+                f"proxy_loss={stat['proxy_loss']:.6e}"
+            )
 
 
 if __name__ == "__main__":
     # 示例：2 轮，5 个 DO；第 2 轮让 DO2 掉线，DO1 做 Lie Attack（放大 1.2）
     run_federated_simulation(
-        num_rounds=2,
+        num_rounds=10,
         num_do=5,
-        model_size=50000,
+        model_size=56714,
         orthogonal_vector_count=1_024,
         bit_length=512,
         precision=10 ** 6,

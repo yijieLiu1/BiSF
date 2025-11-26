@@ -41,7 +41,7 @@ class DO:
     """Data Owner（数据拥有方）"""
     _MNIST_DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
     _MNIST_BATCH_SIZE = 64
-    _MNIST_MAX_BATCHES = 10  # 每轮训练最多使用的 batch 数，避免过慢
+    _MNIST_MAX_BATCHES = 100  # 每轮训练最多使用的 batch 数，避免过慢
     _mnist_loader: Optional[DataLoader] = None
 
     def __init__(self, do_id: int, ta, model_size: int = 10000, precision: int = 10 ** 6, rng_seed: Optional[int] = None):
@@ -303,7 +303,8 @@ class DO:
             optimizer.step()
 
             batches_processed += 1
-            print(f"[DO {self.id}] 训练批次: {batches_processed}")
+            if batches_processed % 10 == 0:
+                print(f"[DO {self.id}] 训练批次: {batches_processed}")
 
         print(f"[DO {self.id}] CNN本地训练完成，使用批次数: {batches_processed}")
 

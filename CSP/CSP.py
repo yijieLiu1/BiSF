@@ -81,10 +81,12 @@ class CSP:
         # print(f"[CSP] 已同步Paillier公参，N={N}, g={self.impaillier.g}, h={self.impaillier.h}, y={self.impaillier.y}")
     # ============== 广播 ==============
     def broadcast_params(self) -> List[float]:
-        try:
-            self.ta.update_keys_for_new_round()
-        except Exception as e:
-            print(f"[CSP] 密钥更新失败: {e}")
+        # 第 1 轮沿用初始化时的密钥/正交向量；从第 2 轮开始每轮刷新
+        if self.round_count > 0:
+            try:
+                self.ta.update_keys_for_new_round()
+            except Exception as e:
+                print(f"[CSP] 密钥更新失败: {e}")
         # 同步本轮最新的正交向量组
         self._load_orthogonal_vectors()
         self.global_params_snapshot = list(self.global_params)
