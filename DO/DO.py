@@ -9,6 +9,8 @@
 # -------------------------------
 import os, sys
 import time
+import json
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -26,25 +28,27 @@ try:
 except Exception:
     _NP_AVAILABLE = False
 
-# 可选 PyTorch + torchvision，用于真实 CNN 训练
+# PyTorch + torchvision，用于真实 CNN 训练
 try:
     import torch
     from torch import nn
     import torch.nn.functional as F
     from torch.utils.data import DataLoader
-    from torchvision import datasets, transforms
+    from torchvision import datasets, transforms, models
     _TORCH_AVAILABLE = True
 except Exception:
     _TORCH_AVAILABLE = False
 
 class DO:
     """Data Owner（数据拥有方）"""
-    _MNIST_DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
-    _MNIST_BATCH_SIZE = 64
-    _MNIST_MAX_BATCHES = 100  # 每轮训练最多使用的 batch 数，避免过慢
-    _mnist_loader: Optional[DataLoader] = None
+    _DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
+    _DEFAULT_BATCH_SIZE = 64
+    _DEFAULT_MAX_BATCHES = 100  # 每轮训练最多使用的 batch 数，避免过慢
+    _data_loader_cache: Dict[str, DataLoader] = {}
 
-    def __init__(self, do_id: int, ta, model_size: int = 10000, precision: int = 10 ** 6, rng_seed: Optional[int] = None):
+    def __init__(self, do_id: int, ta, model_size: int = 10000, precision: int = 10 ** 6, rng_seed: Optional[int] = None,
+                 model_name: str = "lenet", dataset_name: str = "cifar10", batch_size: Optional[int] = None,
+                 max_batches: Optional[int] = None):
         """
         初始化DO
         Args:
@@ -79,6 +83,13 @@ class DO:
         # 训练历史记录
         self.training_history: List[Dict[str, Any]] = []
 
+        # 训练配置
+        self.model_name = model_name.lower()
+        self.dataset_name = dataset_name.lower()
+        self.batch_size = batch_size if batch_size is not None else self._DEFAULT_BATCH_SIZE
+        self.max_batches = max_batches if max_batches is not None else self._DEFAULT_MAX_BATCHES
+        self.data_root = self._DATA_ROOT
+
         # 初始化 CNN 相关组件
         self._check_torch_available()
         self.device = torch.device("cuda" if _TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
@@ -95,38 +106,94 @@ class DO:
             )
 
     @classmethod
-    def _get_mnist_loader(cls) -> DataLoader:
-        if cls._mnist_loader is None:
-            os.makedirs(cls._MNIST_DATA_ROOT, exist_ok=True)
-            transform = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,))
-            ])
-            dataset = datasets.MNIST(
-                root=cls._MNIST_DATA_ROOT,
-                train=True,
-                download=True,
-                transform=transform
-            )
-            cls._mnist_loader = DataLoader(
-                dataset,
-                batch_size=cls._MNIST_BATCH_SIZE,
-                shuffle=True,
-                num_workers=0,
-                drop_last=True
-            )
-        return cls._mnist_loader
+    def _get_dataset_meta(cls, dataset_name: str) -> Dict[str, Any]:
+        """根据数据集名称返回元信息与 transform"""
+        name = dataset_name.lower()
+        if name == "mnist":
+            return {
+                "name": "mnist",
+                "dataset_cls": datasets.MNIST,
+                "in_channels": 1,
+                "input_size": 28,
+                "num_classes": 10,
+                "transform": transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.1307,), (0.3081,))
+                ]),
+            }
+        if name == "cifar10":
+            return {
+                "name": "cifar10",
+                "dataset_cls": datasets.CIFAR10,
+                "in_channels": 3,
+                "input_size": 32,
+                "num_classes": 10,
+                "transform": transforms.Compose([
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+                ]),
+            }
+        if name == "cifar100":
+            return {
+                "name": "cifar100",
+                "dataset_cls": datasets.CIFAR100,
+                "in_channels": 3,
+                "input_size": 32,
+                "num_classes": 100,
+                "transform": transforms.Compose([
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+                ]),
+            }
+        raise ValueError(f"不支持的数据集: {dataset_name}")
+
+    @classmethod
+    def _get_data_loader(cls, dataset_name: str, batch_size: int, data_root: str) -> DataLoader:
+        """返回缓存的数据加载器"""
+        name = dataset_name.lower()
+        cache_key = f"{name}_bs{batch_size}"
+        if cache_key in cls._data_loader_cache:
+            return cls._data_loader_cache[cache_key]
+        meta = cls._get_dataset_meta(dataset_name)
+        os.makedirs(data_root, exist_ok=True)
+        dataset = meta["dataset_cls"](
+            root=data_root,
+            train=True,
+            download=True,
+            transform=meta["transform"]
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=True
+        )
+        cls._data_loader_cache[cache_key] = loader
+        return loader
 
     class _SimpleMNISTCNN(nn.Module):
-        def __init__(self):
+        def __init__(self, in_channels: int = 1, input_size: int = 28, num_classes: int = 10):
             super().__init__()
-            # 中等规模 CNN，参数量约 5.7 万（接近 6 万）
-            self.conv1 = nn.Conv2d(1, 16, 3, 1)    # 1*3*3*16 + 16 ≈ 160
-            self.conv2 = nn.Conv2d(16, 32, 3, 1)   # 16*3*3*32 + 32 ≈ 4.6k
+            # 中等规模 CNN，参数量约 5.7 万（会随输入尺寸略有变化）
+            self.conv1 = nn.Conv2d(in_channels, 16, 3, 1)    # 1*3*3*16 + 16 ≈ 160
+            self.conv2 = nn.Conv2d(16, 32, 3, 1)             # 16*3*3*32 + 32 ≈ 4.6k
             self.pool = nn.MaxPool2d(2)
-            # 输入 28x28：conv->pool->conv->pool -> 32×5×5 = 800
-            self.fc1 = nn.Linear(32 * 5 * 5, 64)   # 800*64 + 64 ≈ 51.2k
-            self.fc2 = nn.Linear(64, 10)           # 64*10 + 10 ≈ 650
+            flat_dim = self._calc_flat_dim(in_channels, input_size)
+            self.fc1 = nn.Linear(flat_dim, 64)              # 800*64 + 64 ≈ 51.2k（MNIST 输入时）
+            self.fc2 = nn.Linear(64, num_classes)           # 64*10 + 10 ≈ 650
+
+        def _calc_flat_dim(self, in_channels: int, input_size: int) -> int:
+            """根据输入尺寸计算全连接层输入维度"""
+            with torch.no_grad():
+                x = torch.zeros(1, in_channels, input_size, input_size)
+                x = self.pool(F.relu(self.conv1(x)))
+                x = self.pool(F.relu(self.conv2(x)))
+                return int(x.numel())
 
         def forward(self, x):
             x = F.relu(self.conv1(x))
@@ -137,6 +204,168 @@ class DO:
             x = F.relu(self.fc1(x))
             x = self.fc2(x)
             return x
+
+    class _LeNet(nn.Module):
+        def __init__(self, in_channels: int = 3, input_size: int = 32, num_classes: int = 10):
+            super().__init__()
+            self.conv1 = nn.Conv2d(in_channels, 6, 5, padding=2)
+            self.pool = nn.AvgPool2d(2, 2)
+            self.conv2 = nn.Conv2d(6, 16, 5)
+            flat_dim = self._calc_flat_dim(in_channels, input_size)
+            self.fc1 = nn.Linear(flat_dim, 120)
+            self.fc2 = nn.Linear(120, 84)
+            self.fc3 = nn.Linear(84, num_classes)
+
+        def _calc_flat_dim(self, in_channels: int, input_size: int) -> int:
+            with torch.no_grad():
+                x = torch.zeros(1, in_channels, input_size, input_size)
+                x = self.pool(F.relu(self.conv1(x)))
+                x = self.pool(F.relu(self.conv2(x)))
+                return int(x.numel())
+
+        def forward(self, x):
+            x = self.pool(F.relu(self.conv1(x)))
+            x = self.pool(F.relu(self.conv2(x)))
+            x = torch.flatten(x, 1)
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
+            x = self.fc3(x)
+            return x
+
+    class _ResNet18(nn.Module):
+        """适配小尺寸输入的 ResNet18（移除初始最大池化，调整首层卷积）"""
+        def __init__(self, in_channels: int = 3, num_classes: int = 10):
+            super().__init__()
+            self.model = models.resnet18(weights=None, num_classes=num_classes)
+            # 调整首层，适配小输入与可变通道数
+            self.model.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            self.model.maxpool = nn.Identity()
+
+        def forward(self, x):
+            return self.model(x)
+
+    class _SmallBasicBlock(nn.Module):
+        expansion = 1
+
+        def __init__(self, in_planes: int, planes: int, stride: int = 1, downsample: Optional[nn.Module] = None):
+            super().__init__()
+            self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(planes)
+            self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn2 = nn.BatchNorm2d(planes)
+            self.downsample = downsample
+
+        def forward(self, x):
+            identity = x
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = F.relu(out, inplace=True)
+            out = self.conv2(out)
+            out = self.bn2(out)
+            if self.downsample is not None:
+                identity = self.downsample(x)
+            out += identity
+            out = F.relu(out, inplace=True)
+            return out
+
+    class _ResNetSmall(nn.Module):
+        """
+        轻量级 ResNet（约 11 万参数，3 通道，10 类），层配置：C=[12,24,48,64]，每组 1 个 BasicBlock。
+        """
+        def __init__(self, in_channels: int = 3, num_classes: int = 10):
+            super().__init__()
+            channels = [12, 24, 48, 64]
+            self.in_planes = channels[0]
+            self.conv1 = nn.Conv2d(in_channels, channels[0], kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(channels[0])
+            self.layer1 = self._make_layer(channels[0], blocks=1, stride=1)
+            self.layer2 = self._make_layer(channels[1], blocks=1, stride=2)
+            self.layer3 = self._make_layer(channels[2], blocks=1, stride=2)
+            self.layer4 = self._make_layer(channels[3], blocks=1, stride=2)
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(channels[3], num_classes)
+
+        def _make_layer(self, planes: int, blocks: int, stride: int) -> nn.Sequential:
+            downsample = None
+            if stride != 1 or self.in_planes != planes:
+                downsample = nn.Sequential(
+                    nn.Conv2d(self.in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm2d(planes),
+                )
+            layers = [DO._SmallBasicBlock(self.in_planes, planes, stride, downsample)]
+            self.in_planes = planes * DO._SmallBasicBlock.expansion
+            for _ in range(1, blocks):
+                layers.append(DO._SmallBasicBlock(self.in_planes, planes))
+            return nn.Sequential(*layers)
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = F.relu(x, inplace=True)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.layer4(x)
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = self.fc(x)
+            return x
+
+    class _ResNet20(nn.Module):
+        """标准 CIFAR ResNet20（3x3 卷积堆叠，3-3-3 BasicBlock 配置）"""
+        def __init__(self, in_channels: int = 3, num_classes: int = 10):
+            super().__init__()
+            self.in_planes = 16
+            self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(16)
+            self.layer1 = self._make_layer(16, blocks=3, stride=1)
+            self.layer2 = self._make_layer(32, blocks=3, stride=2)
+            self.layer3 = self._make_layer(64, blocks=3, stride=2)
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(64, num_classes)
+
+        def _make_layer(self, planes: int, blocks: int, stride: int) -> nn.Sequential:
+            downsample = None
+            if stride != 1 or self.in_planes != planes:
+                downsample = nn.Sequential(
+                    nn.Conv2d(self.in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm2d(planes),
+                )
+            layers = [DO._SmallBasicBlock(self.in_planes, planes, stride, downsample)]
+            self.in_planes = planes * DO._SmallBasicBlock.expansion
+            for _ in range(1, blocks):
+                layers.append(DO._SmallBasicBlock(self.in_planes, planes))
+            return nn.Sequential(*layers)
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = F.relu(x, inplace=True)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = self.fc(x)
+            return x
+
+    def _build_model(self, dataset_name: str) -> nn.Module:
+        meta = self._get_dataset_meta(dataset_name)
+        in_channels = meta["in_channels"]
+        input_size = meta["input_size"]
+        num_classes = meta["num_classes"]
+        name = self.model_name
+        if name in ("mnist_cnn", "cnn", "simple_cnn"):
+            return self._SimpleMNISTCNN(in_channels=in_channels, input_size=input_size, num_classes=num_classes)
+        if name in ("lenet", "lenet5", "lenet_cifar"):
+            return self._LeNet(in_channels=in_channels, input_size=input_size, num_classes=num_classes)
+        if name in ("resnet18", "resnet18_cifar", "resnet_cifar"):
+            return self._ResNet18(in_channels=in_channels, num_classes=num_classes)
+        if name in ("resnet20", "resnet20_cifar"):
+            return self._ResNet20(in_channels=in_channels, num_classes=num_classes)
+        if name in ("resnet_small", "resnet_tiny", "resnet18_small"):
+            return self._ResNetSmall(in_channels=in_channels, num_classes=num_classes)
+        raise ValueError(f"不支持的模型: {self.model_name}")
 
     def _reset_model_parameters(self, model: nn.Module, seed: int) -> None:
         torch.manual_seed(seed)
@@ -266,13 +495,15 @@ class DO:
             本地训练后的"完整参数"向量（几万维）
         """
         self._check_torch_available()
-        print(f"[DO {self.id}] 开始CNN本地训练，模型大小: {self.model_size}维 (MNIST)")
+        dataset_name = self.dataset_name
+        model_name = self.model_name
+        print(f"[DO {self.id}] 开始CNN本地训练，模型大小: {self.model_size}维，数据集 {dataset_name}，模型 {model_name}")
 
         # 使用全局参数哈希作为随机种子，确保每轮初始化与全局状态关联
         seed_source = int(hashlib.sha256(str(global_params).encode('utf-8')).hexdigest(), 16)
         model_seed = (seed_source + self.id) % (2 ** 32)
 
-        model = self._SimpleMNISTCNN().to(self.device)
+        model = self._build_model(dataset_name).to(self.device)
         self._reset_model_parameters(model, model_seed)
         # 将当前收到的全局参数覆盖到模型扁平参数的前K项，确保每轮从全局权重出发
         # 若全局参数近似为全零，跳过覆盖以避免零梯度导致训练停滞
@@ -283,15 +514,15 @@ class DO:
                 print(f"[DO {self.id}] 全局参数近似全零，跳过覆盖，采用良好初始化以避免零梯度。")
         except Exception as e:
             print(f"[DO {self.id}] 应用全局参数初始化失败，将继续使用默认初始化: {e}")
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
         loss_fn = nn.CrossEntropyLoss()
 
-        train_loader = self._get_mnist_loader()
+        train_loader = self._get_data_loader(dataset_name, self.batch_size, self.data_root)
         model.train()
         batches_processed = 0
 
         for batch_idx, (data, target) in enumerate(train_loader):
-            if batch_idx >= self._MNIST_MAX_BATCHES:
+            if batch_idx >= self.max_batches:
                 break
             data = data.to(self.device)
             target = target.to(self.device)
@@ -524,9 +755,9 @@ if __name__ == "__main__":
         raise SystemExit(f"导入失败: {e}")
 
     # 与 DO 的模型规模保持一致：5万维，正交向量组 2048
-    ta = TA(num_do=3, model_size=50000, orthogonal_vector_count=2048, bit_length=512)
+    ta = TA(num_do=3, model_size=83126, orthogonal_vector_count=2048, bit_length=512)
     csp = CSP(ta)
-    do_list = [DO(i, ta) for i in range(3)]
+    do_list = [DO(i, ta,model_size=83126) for i in range(3)]
 
     baseline_params = [1.0, 2.0, 3.0, 4.0, 5.0]
     for do in do_list:
@@ -551,7 +782,7 @@ if __name__ == "__main__":
 
     # 多轮流程：进行 5 轮联邦学习；每轮每个 DO 训练 10 个 batch
     print("\n===== 5. 多轮联邦训练（5轮，每轮10个batch） =====")
-    rounds = 5
+    rounds = 2
     gp_history: List[List[float]] = []
     for r in range(1, rounds + 1):
         print(f"\n----- Round {r} -----")

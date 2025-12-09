@@ -1,3 +1,5 @@
+
+
 ### 双向验证的FL
 
 ##### 1.实现ImprovedPaillier、SafeMul、Threshold工具类。<u>*<!--完成-->*</u>
@@ -53,6 +55,156 @@
 > 4.CSP发送聚合解密后的明文模型参数，DO乘完发给CSP，CSP解密再与自己的相乘。最后相加。？
 
 ![image-20251118155624924](C:\Users\leg\AppData\Roaming\Typora\typora-user-images\image-20251118155624924.png)
+
+```python
+# ============== 真实密钥构建 ==============
+def _hash_global_params(self, global_params: List[float]) -> int:
+    s = str(global_params).encode("utf-8")
+    h = hashlib.sha256(s).digest()
+    return int.from_bytes(h, "big", signed=False)
+
+def update_key(self, global_params: List[float]) -> None:
+    N2 = self.ta.get_N() ** 2
+    self.base_private_key = self.ta.get_base_key(self.id)
+    h = self._hash_global_params(global_params)
+    self.round_private_key = pow(self.base_private_key, h, N2)
+
+# ============== 掉线DO的密钥恢复 ==============
+def upload_key_share(self, missing_do_id: int) -> Optional[int]:
+    entry = self.ta.do_key_shares[missing_do_id]
+    share = entry["shares"].get(self.id)
+    return share
+
+# ============== 安全向量内积协议 ==============
+CSP：payload = {
+    "p": ...,        # 大素数
+    "alpha": ...,    # 随机掩码
+    "C_all": ...,    # 第一轮中得到的密文集合
+}
+DO：拿自己的模型向量 b_vector+r 参与第二轮计算D_sums。减去随机数，计算do_part：
+def safe_mul_round2_process(self, payload: Dict[str, Any], b_vector: List[float]) -> Dict[str, Any]:
+    sip = SafeInnerProduct(precision_factor=self.precision)
+    p, alpha, C_all = payload['p'], payload['alpha'], payload['C_all']
+
+    # 生成参数随机掩码 r，并构造带掩码的 b_masked
+    r_vec = [self._rng.uniform(-1.0, 1.0) for _ in range(len(b_vector))]
+    b_masked = [b + r for b, r in zip(b_vector, r_vec)]
+
+    # 密文态计算（使用 b_masked）
+    D_sums = sip.round2_client_process(b_masked, C_all, alpha, p)
+
+    # 明文态计算真实 <b, u_k>（从 <b_masked, u_k> 中减去 <r, u_k>）
+    do_part = []
+    for u in self.orthogonal_vectors_for_do:
+        masked_dot = sum((bi + ri) * ui for bi, ri, ui in zip(b_vector, r_vec, u))
+        mask_bias = sum(ri * ui for ri, ui in zip(r_vec, u))
+        do_part.append(masked_dot - mask_bias)
+
+    return {'D_sums': D_sums, 'do_part': do_part}
+
+try:
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+    from torchvision import datasets, transforms
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
+    
+# 1. 准备数据
+meta = _get_dataset_meta(dataset_name)
+train_dataset = meta["dataset_cls"](
+    root=data_root,
+    train=True,
+    download=True,
+    transform=meta["transform"]
+)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# 2. 构建模型
+model = SimpleCNN(
+    in_channels=meta["in_channels"],
+    input_size=meta["input_size"],
+    num_classes=meta["num_classes"]
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+# 3. 训练循环
+model.train()
+for data, target in train_loader:
+    data, target = data.to(device), target.to(device)
+
+    optimizer.zero_grad()
+    logits = model(data)
+    loss = loss_fn(logits, target)
+    loss.backward()
+    optimizer.step()
+
+# 4. 导出参数向量
+params = []
+for p in model.parameters():
+    params.append(p.view(-1))
+flat_params = torch.cat(params).cpu().numpy().tolist()
+
+
+# 1) 初始化：生成 Paillier 参数 + R_t + 每个 DO 的 sk
+impaillier = ImprovedPaillier(m=num_do, bit_length=bit_length, precision=precision)
+N = impaillier.getN()
+R_t = impaillier.R_t
+n_i = list(impaillier.n_i)            # 每个 DO 的指数
+SK_DO = list(impaillier.SK_DO)        # 每个 DO 的基础私钥 sk_i = R_t^{n_i} mod N^2
+do_private_keys = {i: SK_DO[i] for i in range(num_do)}
+# 注：TA 把 do_private_keys 存好并通过 get_base_key() 提供给 DO
+
+# 2) 对每个 DO 的 sk 进行门限分片（Shamir）
+for i in range(num_do):
+    shares, prime = split_secret(do_private_keys[i], threshold, num_do)
+    # 存储供恢复时使用：do_key_shares[i] = {'shares': {donor: share}, 'prime': prime}
+    do_key_shares[i] = {'shares': {j: shares[j+1] for j in range(num_do) if j!=i}, 'prime': prime}
+# 注：每个 DO 保留其它 DO 的分片，用于门限恢复
+
+# 3) 每轮结束时旋转 R_t，重算 sk 并重新分片
+def rotate_R_t():
+    # 生成新的 R_t（与 N 互质）
+    while True:
+        cand = secrets.randbits(bit_length)
+        if cand>1 and math.gcd(cand, N)==1:
+            R_t = cand
+            break
+    # 重新计算 sk_i 并刷新分片
+    N2 = N*N
+    for i in range(num_do):
+        do_private_keys[i] = pow(R_t, n_i[i], N2)
+    regenerate_shares()  # 重新 split_secret 并覆盖 do_key_shares
+# 注：确保每轮密钥、分片都更新，防止长期重用
+
+# 4) 生成全局正交向量并拆分给 CSP/DO（NumPy 版本）
+A = rng.standard_normal((MODEL_SIZE, ORTH_COUNT))   # d × k
+Q, _ = np.linalg.qr(A, mode='reduced')              # 列正交（d × k）
+U = [Q[:, i].tolist() for i in range(ORTH_COUNT)]   # 全局正交基 U
+
+ratios = rng.random((ORTH_COUNT, MODEL_SIZE))       # 每元素的拆分比例
+U_np = np.array(U)                                  # (k, d)
+U_csp = (U_np * ratios).tolist()                    # 分给 CSP 的部分
+U_do  = (U_np * (1.0 - ratios)).tolist()            # 分给 DO 的部分
+# 注：U = U_csp + U_do（按元素相加近似恢复 U），单方不可还原完整 U
+
+# Round 1 (PA)
+generate p, α, s; compute s⁻¹ mod p
+for each A: C ← s · (α·A + random_c) mod p
+
+# Round 2 (PB)
+for each C: D ← Σ (α·B·C + random_r·C_extra) mod p
+
+# Round 3 (PA)
+for each D: E ← s⁻¹·D mod p
+output inner_product ≈ floor(E / α²)
+
+
+```
 
 
 

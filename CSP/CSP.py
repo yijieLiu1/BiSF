@@ -15,7 +15,7 @@ from utils.SafeMul import SafeInnerProduct
 class CSP:
     """中心服务器（CSP）"""
 
-    def __init__(self, ta, model_size: Optional[int] = None, precision: int = 10 ** 6):
+    def __init__(self, ta, model_size: Optional[int] = None, precision: int = 10 ** 6, initial_params_path: Optional[str] = None):
         self.ta = ta
         if model_size is None and hasattr(self.ta, "get_model_size"):
             try:
@@ -30,6 +30,8 @@ class CSP:
         self.global_params: List[float] = [0.0] * self.model_size
         self.global_params_snapshot: List[float] = list(self.global_params)
         self.round_count: int = 0
+        if initial_params_path:
+            self._try_load_initial_params(initial_params_path)
 
         # 为掉线恢复缓存
         # 恢复的是掉线DO的n_i值
@@ -46,6 +48,34 @@ class CSP:
         # 使用 ImprovedPaillier，但用 TA 的参数覆盖，确保全局一致
         self.impaillier = ImprovedPaillier(m=self.ta.num_do, bit_length=512, precision=self.precision)
         self._sync_paillier_with_ta()
+
+    def _try_load_initial_params(self, path: str) -> None:
+        """可选地从文件加载初始全局参数"""
+        try:
+            import json
+            if not os.path.exists(path):
+                print(f"[CSP] 初始参数文件不存在，忽略: {path}")
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            params = data.get("params") if isinstance(data, dict) else None
+            if params is None:
+                if isinstance(data, list):
+                    params = data
+                else:
+                    print(f"[CSP] 初始参数文件格式不含 params，忽略: {path}")
+                    return
+            if len(params) < self.model_size:
+                params = list(params) + [0.0] * (self.model_size - len(params))
+                print(f"[CSP] 初始参数长度不足，已用0填充到 {self.model_size}")
+            elif len(params) > self.model_size:
+                params = params[:self.model_size]
+                print(f"[CSP] 初始参数长度超过模型尺寸，已截断到 {self.model_size}")
+            self.global_params = list(map(float, params))
+            self.global_params_snapshot = list(self.global_params)
+            print(f"[CSP] 已从文件加载初始全局参数: {path}，维度 {len(self.global_params)}")
+        except Exception as e:
+            print(f"[CSP] 加载初始参数失败（忽略，使用默认0向量）: {e}")
 
     def _load_orthogonal_vectors(self) -> None:
         self.orthogonal_vectors_for_csp = self.ta.get_orthogonal_vectors_for_csp()

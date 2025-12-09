@@ -22,7 +22,7 @@ from TA.TA import TA
 from CSP.CSP import CSP
 from DO.DO import DO
 
-
+#默认参数。Test调用时还会传参
 def run_federated_simulation(
     num_rounds: int = 2,
     num_do: int = 3,
@@ -33,12 +33,21 @@ def run_federated_simulation(
     dropouts: Optional[Dict[int, List[int]]] = None,
     dropout_round: Optional[int] = None,
     dropout_do_ids: Optional[List[int]] = None,
-    attack_round: Optional[int] = 1,
-    attack_do_id: Optional[int] = 2,
-    attack_type: str = "random",
+    attack_round: Optional[int] = None,
+    attack_do_id: Optional[int] = None,
     #stealth隐蔽投毒，二分找到恶意DO / random随机数 / signflip反向梯度 /lie_stat放大梯度
+    attack_type: str = None,
     attack_lambda: float = 0.2,
     attack_sigma: float = 1.0,
+    #模型名称和数据集名称："lenet/mnist_cnn","mnist/cifar10"
+    model_name: str = "mnist_cnn",
+    dataset_name: str = "mnist",
+    #DO训练的batch选项
+    train_batch_size: Optional[int] = None,
+    train_max_batches: Optional[int] = None,
+    #可选的模型参数，可以指定使用已训练过的全局模型参数作为初始参数：
+    initial_params_path="trainResult/lenet_cifar10_global_params_round10.json",
+    # initial_params_path: Optional[str] = None,
 ) -> None:
     """
     运行一次联邦学习流程。
@@ -98,8 +107,20 @@ def run_federated_simulation(
         bit_length=bit_length,
         precision=precision,
     )
-    csp = CSP(ta, model_size=model_size, precision=precision)
-    do_list: List[Optional[DO]] = [DO(i, ta, model_size=model_size, precision=precision) for i in range(num_do)]
+    csp = CSP(ta, model_size=model_size, precision=precision, initial_params_path=initial_params_path)
+    do_list: List[Optional[DO]] = [
+        DO(
+            i,
+            ta,
+            model_size=model_size,
+            precision=precision,
+            model_name=model_name,
+            dataset_name=dataset_name,
+            batch_size=train_batch_size,
+            max_batches=train_max_batches,
+        )
+        for i in range(num_do)
+    ]
     round_stats: List[Dict[str, float]] = []
 
     def run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> None:
@@ -245,9 +266,17 @@ def run_federated_simulation(
     # 保存最终全局参数
     try:
         os.makedirs("trainResult", exist_ok=True)
-        result_path = os.path.join("trainResult", f"global_params_round{num_rounds}.json")
+        model_tag = model_name.lower().replace(" ", "_")
+        dataset_tag = dataset_name.lower().replace(" ", "_")
+        result_path = os.path.join("trainResult", f"{model_tag}_{dataset_tag}_global_params_round{num_rounds}.json")
         with open(result_path, "w", encoding="utf-8") as f:
-            json.dump({"rounds": num_rounds, "model_size": len(csp.global_params), "params": csp.global_params}, f)
+            json.dump({
+                "rounds": num_rounds,
+                "model_size": len(csp.global_params),
+                "params": csp.global_params,
+                "model_name": model_name,
+                "dataset_name": dataset_name,
+            }, f)
         print(f"全局参数已保存至: {result_path}")
     except Exception as e:
         print(f"保存全局参数失败: {e}")
@@ -267,13 +296,17 @@ if __name__ == "__main__":
     run_federated_simulation(
         num_rounds=10,
         num_do=5,
-        model_size=56714,
+        model_size=83126,
         orthogonal_vector_count=1_024,
         bit_length=512,
         precision=10 ** 6,
-        attack_type= "signflip",
+        # attack_type= "signflip",
         # dropouts={1: [2]},
-        attack_round=1,
-        attack_do_id=4,
-        attack_lambda=0.4,
+        # attack_round=1,
+        # attack_do_id=4,
+        # attack_lambda=0.4,
+        model_name="lenet",
+        dataset_name="cifar10",
+        train_batch_size=128,
+        train_max_batches=400,
     )
