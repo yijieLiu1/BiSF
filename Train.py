@@ -16,6 +16,7 @@ from typing import List, Optional
 
 from TA.TA import TA
 from DO.DO import DO  # 复用模型与数据集工厂
+import ModelTest  # 复用评估逻辑
 
 
 def infer_model_size(model_name: str, dataset_name: str) -> int:
@@ -82,19 +83,26 @@ def apply_poison(vec: List[float], attack_type: str, attack_lambda: float, attac
 
 
 def main() -> None:
+    #MNIST训练集按照batchsize=128时，大约切成468个batch，每个DO取400个batch进行训练，相当于差不多一次一个DO跑一个epoch
     parser = argparse.ArgumentParser(description="DO 明文训练（支持投毒），输出全局参数")
-    parser.add_argument("--rounds", type=int, default=30, help="训练轮数")
-    parser.add_argument("--num-do", type=int, default=4, help="DO 数量")
+    parser.add_argument("--rounds", type=int, default=100, help="训练轮数")
+    parser.add_argument("--num-do", type=int, default=10, help="DO 数量")
     parser.add_argument("--model-name", type=str, default="resnet20", help="模型名称（mnist_cnn/lenet/resnet18/resnet20")
     parser.add_argument("--dataset-name", type=str, default="cifar10", help="数据集名称（mnist/cifar10）")
-    parser.add_argument("--batch-size", type=int, default=128, help="训练批大小")
-    parser.add_argument("--max-batches", type=int, default=400, help="每轮使用的批次数上限")
+    parser.add_argument("--batch-size", type=int, default=64, help="训练批大小")
+    parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
+    #投毒设置
     parser.add_argument("--poison-do-id", type=int, default=None, help="指定持续投毒的 DO id（默认不投毒）")
     parser.add_argument("--attack-type", type=str, default=None, help="投毒类型（stealth/random/signflip/lie_stat）")
     parser.add_argument("--attack-lambda", type=float, default=0.2, help="投毒放大系数")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="随机投毒的标准差")
-    parser.add_argument("--save-path", type=str, default=os.path.join("trainResult", "do_resnet20_train_params.json"), help="保存参数路径")
-    parser.add_argument("--initial-params-path", type=str, default="trainResult/do_resnet20_train_params.json", help="trainResult/do_train_params.json")
+    #结果保存
+    parser.add_argument("--save-path", type=str, default=os.path.join("trainResult", "do_resnet20_150_train_params.json"), help="保存参数路径")
+    parser.add_argument("--initial-params-path", type=str, default=None, help="trainResult/do_train_params.json")
+    #模型推理测试
+    parser.add_argument("--eval-batch-size", type=int, default=256, help="每轮推理评估批大小")
+    parser.add_argument("--eval-batches", type=int, default=50, help="每轮评估使用的批次数上限（train/val）")
+    parser.add_argument("--bn-calib-batches", type=int, default=30, help="BN 校准用的训练批次数（仅 resnet 有效）")
     args = parser.parse_args()
 
     model_size = infer_model_size(args.model_name, args.dataset_name)
@@ -120,6 +128,10 @@ def main() -> None:
     # 初始全局参数
     global_params = load_initial_params(args.initial_params_path, model_size)
     rng = random.Random(2025)
+    prev_global = None
+    convergence_history = []
+    train_metric_history = []
+    val_metric_history = []
 
     for r in range(1, args.rounds + 1):
         print(f"\n----- Round {r}/{args.rounds} -----")
@@ -141,7 +153,53 @@ def main() -> None:
         if active > 0:
             agg = [v / active for v in agg]
         global_params = agg
+
+        # 收敛指标：与上一轮全局参数的差异
+        if prev_global is None:
+            print("[Train] 首轮，无收敛对比指标")
+        else:
+            sq = 0.0
+            m_abs = 0.0
+            for x, y in zip(prev_global, global_params):
+                d = y - x
+                sq += d * d
+                ad = abs(d)
+                if ad > m_abs:
+                    m_abs = ad
+            l2 = sq ** 0.5
+            convergence_history.append({"round": r, "l2": l2, "linf": m_abs})
+            print(f"[Train] 收敛指标：L2差={l2:.6f}, L∞差={m_abs:.6f}")
+        prev_global = list(global_params)
+
         print(f"[Train] 全局参数前5项: {global_params[:5]}")
+        # 训练/验证评估
+        try:
+            train_loss, train_acc, tb = ModelTest.evaluate_params(
+                global_params,
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                batch_size=args.eval_batch_size,
+                max_batches=args.eval_batches,
+                data_root=os.path.join(os.path.dirname(__file__), "data"),
+                split="train",
+                bn_calib_batches=args.bn_calib_batches,
+            )
+            val_loss, val_acc, vb = ModelTest.evaluate_params(
+                global_params,
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                batch_size=args.eval_batch_size,
+                max_batches=args.eval_batches,
+                data_root=os.path.join(os.path.dirname(__file__), "data"),
+                split="val",
+                bn_calib_batches=args.bn_calib_batches,
+            )
+            train_metric_history.append({"round": r, "loss": train_loss, "acc": train_acc})
+            val_metric_history.append({"round": r, "loss": val_loss, "acc": val_acc})
+            print(f"[Eval][Round {r}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% (batches {tb})")
+            print(f"[Eval][Round {r}] Val   loss={val_loss:.4f}, acc={val_acc*100:.2f}% (batches {vb})")
+        except Exception as e:
+            print(f"[Eval][Round {r}] 评估失败: {e}")
 
     Path(args.save_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.save_path).write_text(
@@ -161,6 +219,14 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"[Train] 训练完成，参数已保存: {args.save_path}")
+    if convergence_history:
+        print("\n===== 收敛指标汇总（相邻轮差） =====")
+        for item in convergence_history:
+            print(f"Round {item['round']}: L2={item['l2']:.6f}, L∞={item['linf']:.6f}")
+    if train_metric_history and val_metric_history:
+        print("\n===== 训练/验证指标汇总（按轮） =====")
+        for tm, vm in zip(train_metric_history, val_metric_history):
+            print(f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}% | Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%")
 
 
 if __name__ == "__main__":

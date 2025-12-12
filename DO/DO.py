@@ -33,7 +33,7 @@ try:
     import torch
     from torch import nn
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
     from torchvision import datasets, transforms, models
     _TORCH_AVAILABLE = True
 except Exception:
@@ -90,6 +90,11 @@ class DO:
         self.max_batches = max_batches if max_batches is not None else self._DEFAULT_MAX_BATCHES
         self.data_root = self._DATA_ROOT
 
+        # 持久化模型/优化器（仅在 resnet 系列下复用，避免 BN 统计重置）
+        self._persist_model = None
+        self._persist_optimizer = None
+        self._persist_scheduler = None
+
         # 初始化 CNN 相关组件
         self._check_torch_available()
         self.device = torch.device("cuda" if _TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
@@ -98,6 +103,10 @@ class DO:
             print(f"[DO {self.id}] 使用 GPU: {torch.cuda.get_device_name(self.device)}")
         
         print(f"[DO {self.id}] 初始化完成，模型大小: {self.model_size}, 精度: {self.precision}")
+
+        # 对 ResNet 系列，在设备初始化之后再创建持久化模型/优化器，避免 device 未就绪
+        if self.model_name.startswith("resnet") and self._persist_model is None:
+            self._init_persistent_model()
 
     def _check_torch_available(self) -> None:
         if not _TORCH_AVAILABLE:
@@ -153,9 +162,9 @@ class DO:
 
     @classmethod
     def _get_data_loader(cls, dataset_name: str, batch_size: int, data_root: str) -> DataLoader:
-        """返回缓存的数据加载器"""
+        """返回缓存的数据加载器（使用官方二进制数据 + 80% 训练索引）"""
         name = dataset_name.lower()
-        cache_key = f"{name}_bs{batch_size}"
+        cache_key = f"{name}_bs{batch_size}_root{data_root}"
         if cache_key in cls._data_loader_cache:
             return cls._data_loader_cache[cache_key]
         meta = cls._get_dataset_meta(dataset_name)
@@ -166,8 +175,17 @@ class DO:
             download=True,
             transform=meta["transform"]
         )
+        # 加载拆分索引
+        split_dir = os.path.join(data_root, "splits")
+        train_idx_path = os.path.join(split_dir, f"{name}_train_idx.json")
+        if not os.path.exists(train_idx_path):
+            raise FileNotFoundError(f"[DO] 未找到训练索引 {train_idx_path}，请先运行 split_datasets.py 生成 80/20 拆分索引")
+        import json
+        with open(train_idx_path, "r", encoding="utf-8") as f:
+            train_idx = json.load(f)
+        subset = Subset(dataset, train_idx)
         loader = DataLoader(
-            dataset,
+            subset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=0,
@@ -366,6 +384,29 @@ class DO:
         if name in ("resnet_small", "resnet_tiny", "resnet18_small"):
             return self._ResNetSmall(in_channels=in_channels, num_classes=num_classes)
         raise ValueError(f"不支持的模型: {self.model_name}")
+    def _init_persistent_model(self) -> None:
+        model = self._build_model(self.dataset_name).to(self.device)
+        model_seed = 12345 + self.id
+        self._reset_model_parameters(model, model_seed)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
+        # 不用 scheduler，或者后面按轮更新
+        scheduler = None
+        self._persist_model = model
+        self._persist_optimizer = optimizer
+        self._persist_scheduler = scheduler
+
+    # def _init_persistent_model(self) -> None:
+    #     """仅针对 ResNet 系列，初始化一次模型/优化器/调度器并持久化，保持 BN running 统计连续积累。"""
+    #     model = self._build_model(self.dataset_name).to(self.device)
+    #     # 初始化权重（一次性）
+    #     model_seed = 12345 + self.id
+    #     self._reset_model_parameters(model, model_seed)
+    #     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
+    #     step_size = max(1, self.max_batches // 2)
+    #     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
+    #     self._persist_model = model
+    #     self._persist_optimizer = optimizer
+    #     self._persist_scheduler = scheduler
 
     def _reset_model_parameters(self, model: nn.Module, seed: int) -> None:
         torch.manual_seed(seed)
@@ -387,10 +428,14 @@ class DO:
         """
         将给定的一维参数向量写回到模型参数张量中（按 PyTorch 参数迭代顺序）。
         仅覆盖前 len(flat) 个元素，多余的模型参数保持不变。
+        ResNet 系列：BN 的 weight/bias 保持本地，不随全局覆盖（FedBN 思路）。
         """
         with torch.no_grad():
             offset = 0
             for param in model.parameters():
+                if self.model_name.startswith("resnet") and isinstance(param, nn.BatchNorm2d):
+                    offset += param.numel()
+                    continue
                 numel = param.numel()
                 if offset >= len(flat):
                     break
@@ -494,6 +539,8 @@ class DO:
         Returns:
             本地训练后的"完整参数"向量（几万维）
         """
+        
+
         self._check_torch_available()
         dataset_name = self.dataset_name
         model_name = self.model_name
@@ -503,10 +550,19 @@ class DO:
         seed_source = int(hashlib.sha256(str(global_params).encode('utf-8')).hexdigest(), 16)
         model_seed = (seed_source + self.id) % (2 ** 32)
 
-        model = self._build_model(dataset_name).to(self.device)
-        self._reset_model_parameters(model, model_seed)
-        # 将当前收到的全局参数覆盖到模型扁平参数的前K项，确保每轮从全局权重出发
-        # 若全局参数近似为全零，跳过覆盖以避免零梯度导致训练停滞
+        use_persistent = self.model_name.startswith("resnet")
+        if use_persistent:
+            # 持久化模式：复用同一模型/优化器/调度器，保持 BN running 统计
+            model = self._persist_model
+            optimizer = self._persist_optimizer
+            scheduler = self._persist_scheduler
+        else:
+            model = self._build_model(dataset_name).to(self.device)
+            self._reset_model_parameters(model, model_seed)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=5e-4)
+            step_size = max(1, self.max_batches // 2)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
+        # 将当前收到的全局参数覆盖到模型扁平参数的前K项，确保每轮从全局权重出发（不触碰 BN running 统计）
         try:
             if any(abs(v) > 1e-12 for v in global_params):
                 self._assign_flat_to_model(model, list(global_params))
@@ -514,7 +570,6 @@ class DO:
                 print(f"[DO {self.id}] 全局参数近似全零，跳过覆盖，采用良好初始化以避免零梯度。")
         except Exception as e:
             print(f"[DO {self.id}] 应用全局参数初始化失败，将继续使用默认初始化: {e}")
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
         loss_fn = nn.CrossEntropyLoss()
 
         train_loader = self._get_data_loader(dataset_name, self.batch_size, self.data_root)
@@ -532,6 +587,8 @@ class DO:
             loss = loss_fn(output, target)
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             batches_processed += 1
             if batches_processed % 10 == 0:
