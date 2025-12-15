@@ -395,18 +395,6 @@ class DO:
         self._persist_optimizer = optimizer
         self._persist_scheduler = scheduler
 
-    # def _init_persistent_model(self) -> None:
-    #     """仅针对 ResNet 系列，初始化一次模型/优化器/调度器并持久化，保持 BN running 统计连续积累。"""
-    #     model = self._build_model(self.dataset_name).to(self.device)
-    #     # 初始化权重（一次性）
-    #     model_seed = 12345 + self.id
-    #     self._reset_model_parameters(model, model_seed)
-    #     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
-    #     step_size = max(1, self.max_batches // 2)
-    #     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
-    #     self._persist_model = model
-    #     self._persist_optimizer = optimizer
-    #     self._persist_scheduler = scheduler
 
     def _reset_model_parameters(self, model: nn.Module, seed: int) -> None:
         torch.manual_seed(seed)

@@ -193,19 +193,19 @@ def main():
     parser.add_argument(
         "--params",
         type=str,
-        default=os.path.join("trainResult", "do_resnet20_150_train_params.json"),
+        default=os.path.join("trainResult", "cnn_mnist_global_params_round10.json"),
         help="保存的全局参数文件路径",
     )
     parser.add_argument(
         "--model-name",
         type=str,
-        default="resnet20",
+        default="cnn",
         help="模型名称：cnn/lenet/resnet18/resnet20，留空则用文件元数据或默认 resnet18",
     )
     parser.add_argument(
         "--dataset-name",
         type=str,
-        default="cifar10",
+        default="mnist",
         help="数据集名称：mnist/cifar10/cifar100，留空则用文件元数据或默认 cifar10",
     )
     parser.add_argument(

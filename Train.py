@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import random
 from typing import List, Optional
+import time
 
 from TA.TA import TA
 from DO.DO import DO  # 复用模型与数据集工厂
@@ -85,19 +86,19 @@ def apply_poison(vec: List[float], attack_type: str, attack_lambda: float, attac
 def main() -> None:
     #MNIST训练集按照batchsize=128时，大约切成468个batch，每个DO取400个batch进行训练，相当于差不多一次一个DO跑一个epoch
     parser = argparse.ArgumentParser(description="DO 明文训练（支持投毒），输出全局参数")
-    parser.add_argument("--rounds", type=int, default=100, help="训练轮数")
+    parser.add_argument("--rounds", type=int, default=5, help="训练轮数")
     parser.add_argument("--num-do", type=int, default=10, help="DO 数量")
-    parser.add_argument("--model-name", type=str, default="resnet20", help="模型名称（mnist_cnn/lenet/resnet18/resnet20")
-    parser.add_argument("--dataset-name", type=str, default="cifar10", help="数据集名称（mnist/cifar10）")
+    parser.add_argument("--model-name", type=str, default="lenet", help="模型名称（cnn/lenet/resnet18/resnet20")
+    parser.add_argument("--dataset-name", type=str, default="mnist", help="数据集名称（mnist/cifar10）")
     parser.add_argument("--batch-size", type=int, default=64, help="训练批大小")
     parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
     #投毒设置
     parser.add_argument("--poison-do-id", type=int, default=None, help="指定持续投毒的 DO id（默认不投毒）")
     parser.add_argument("--attack-type", type=str, default=None, help="投毒类型（stealth/random/signflip/lie_stat）")
-    parser.add_argument("--attack-lambda", type=float, default=0.2, help="投毒放大系数")
+    parser.add_argument("--attack-lambda", type=float, default=0.25, help="投毒放大系数")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="随机投毒的标准差")
     #结果保存
-    parser.add_argument("--save-path", type=str, default=os.path.join("trainResult", "do_resnet20_150_train_params.json"), help="保存参数路径")
+    parser.add_argument("--save-path", type=str, default=os.path.join("trainResult", "do_cnn_5_train_params.json"), help="保存参数路径")
     parser.add_argument("--initial-params-path", type=str, default=None, help="trainResult/do_train_params.json")
     #模型推理测试
     parser.add_argument("--eval-batch-size", type=int, default=256, help="每轮推理评估批大小")
@@ -132,8 +133,13 @@ def main() -> None:
     convergence_history = []
     train_metric_history = []
     val_metric_history = []
+    round_times = []
+    best_params = None
+    best_val_acc = -1.0
 
+    total_start = time.time()
     for r in range(1, args.rounds + 1):
+        round_start = time.time()
         print(f"\n----- Round {r}/{args.rounds} -----")
         updates = {}
         for do in do_list:
@@ -198,9 +204,18 @@ def main() -> None:
             val_metric_history.append({"round": r, "loss": val_loss, "acc": val_acc})
             print(f"[Eval][Round {r}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% (batches {tb})")
             print(f"[Eval][Round {r}] Val   loss={val_loss:.4f}, acc={val_acc*100:.2f}% (batches {vb})")
+            # 记录最优（按 val acc，否则按 train acc）
+            target_acc = val_acc if val_metric_history else train_acc
+            if target_acc > best_val_acc:
+                best_val_acc = target_acc
+                best_params = list(global_params)
         except Exception as e:
             print(f"[Eval][Round {r}] 评估失败: {e}")
+        round_elapsed = time.time() - round_start
+        round_times.append(round_elapsed)
+        print(f"[Train] Round {r} 用时: {round_elapsed:.2f}s")
 
+    total_elapsed = time.time() - total_start
     Path(args.save_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.save_path).write_text(
         json.dumps(
@@ -219,6 +234,43 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"[Train] 训练完成，参数已保存: {args.save_path}")
+    # 额外保存最优参数（按 val acc，否则 train acc）
+    if best_params is not None:
+        best_path = Path(args.save_path).with_name(Path(args.save_path).stem + "_best.json")
+        best_path.write_text(
+            json.dumps(
+                {
+                    "rounds": args.rounds,
+                    "model_size": len(best_params),
+                    "params": best_params,
+                    "model_name": args.model_name,
+                    "dataset_name": args.dataset_name,
+                    "best_metric": best_val_acc,
+                }
+            ),
+            encoding="utf-8",
+        )
+        print(f"[Train] 最优参数已保存: {best_path}")
+    # 保存日志（收敛、评估、用时）
+    log_path = Path(args.save_path).with_suffix(".txt")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"总用时: {total_elapsed:.2f}s\n")
+        f.write("按轮用时(s): " + ", ".join(f"{t:.2f}" for t in round_times) + "\n\n")
+        if convergence_history:
+            f.write("收敛指标（ΔL2, ΔL∞）:\n")
+            for item in convergence_history:
+                f.write(f"Round {item['round']}: L2={item['l2']:.6f}, L∞={item['linf']:.6f}\n")
+            f.write("\n")
+        if train_metric_history and val_metric_history:
+            f.write("训练/验证指标:\n")
+            for tm, vm in zip(train_metric_history, val_metric_history):
+                f.write(
+                    f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}% | "
+                    f"Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%\n"
+                )
+        f.write("\n")
+    print(f"[Train] 日志已保存: {log_path}")
+    print(f"[Train] 总用时: {total_elapsed:.2f}s")
     if convergence_history:
         print("\n===== 收敛指标汇总（相邻轮差） =====")
         for item in convergence_history:

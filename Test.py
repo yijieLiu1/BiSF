@@ -13,6 +13,7 @@ import time
 import random
 import math
 import json
+import argparse
 from typing import Dict, List, Optional
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -21,6 +22,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 from TA.TA import TA
 from CSP.CSP import CSP
 from DO.DO import DO
+import ModelTest
 
 #默认参数。Test调用时还会传参
 def run_federated_simulation(
@@ -48,6 +50,12 @@ def run_federated_simulation(
     #可选的模型参数，可以指定使用已训练过的全局模型参数作为初始参数：
     initial_params_path="trainResult/lenet_cifar10_global_params_round10.json",
     # initial_params_path: Optional[str] = None,
+    # 评估相关：每轮在 train/val 上做推理（明文），可选 BN 校准（ResNet）
+    #是否每一轮都进行一次推理，查看准确率
+    eval_each_round: bool = True,
+    eval_batch_size: int = 256,
+    eval_batches: int = 50,
+    bn_calib_batches: int = 0,
 ) -> None:
     """
     运行一次联邦学习流程。
@@ -142,7 +150,26 @@ def run_federated_simulation(
         if temporary:
             csp.do_projection_map = backup
 
+    round_times = []
+    eval_history: List[Dict[str, float]] = []
+    best_params = None
+    best_metric = -1.0  # 优先用 val acc，如果没有则用 train acc
+    # 构造统一的运行标签：模型_数据集_do数_场景_轮数
+    def _build_run_tag() -> str:
+        model_tag = model_name.lower().replace(" ", "_")
+        dataset_tag = dataset_name.lower().replace(" ", "_")
+        if attack_type and attack_round is not None:
+            scenario_tag = f"{attack_type.lower()}投毒加检测"
+        else:
+            scenario_tag = "正常"
+        scenario_tag = scenario_tag.replace(" ", "")
+        return f"{model_tag}_{dataset_tag}_{num_do}do_{scenario_tag}_{num_rounds}r"
+
+    run_tag = _build_run_tag()
+
+    total_start = time.time()
     for round_idx in range(1, num_rounds + 1):
+        round_start = time.time()
         print(f"\n===== Round {round_idx}: 广播参数 =====")
         global_params = csp.broadcast_params()
 
@@ -237,6 +264,33 @@ def run_federated_simulation(
         updated_params = csp.round_aggregate_and_update(working_do_list, do_cipher_map)
         print(f"[Round {round_idx}] 更新后的全局参数前5: {updated_params[:5]}")
 
+        # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
+        if eval_each_round:
+            try:
+                train_loss, train_acc, _ = ModelTest.evaluate_params(
+                    updated_params,
+                    model_name=model_name,
+                    dataset_name=dataset_name,
+                    batch_size=eval_batch_size,
+                    max_batches=eval_batches,
+                    data_root=os.path.join(os.path.dirname(__file__), "data"),
+                    split="train",
+                    bn_calib_batches=bn_calib_batches,
+                )
+                val_loss, val_acc, _ = ModelTest.evaluate_params(
+                    updated_params,
+                    model_name=model_name,
+                    dataset_name=dataset_name,
+                    batch_size=eval_batch_size,
+                    max_batches=eval_batches,
+                    data_root=os.path.join(os.path.dirname(__file__), "data"),
+                    split="val",
+                    bn_calib_batches=bn_calib_batches,
+                )
+                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%")
+            except Exception as e:
+                print(f"[Eval][Round {round_idx}] 评估失败: {e}")
+
         # 训练效果评估（无测试集版本）：看参数值收敛性
         gap = _vector_gap(updated_params, global_params)
         summary = _vector_summary(updated_params)
@@ -256,19 +310,74 @@ def run_federated_simulation(
             "abs_max": summary['abs_max'],
             "proxy_loss": proxy_loss,
         })
+        # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
+        if eval_each_round:
+            try:
+                train_loss, train_acc, _ = ModelTest.evaluate_params(
+                    updated_params,
+                    model_name=model_name,
+                    dataset_name=dataset_name,
+                    batch_size=eval_batch_size,
+                    max_batches=eval_batches,
+                    data_root=os.path.join(os.path.dirname(__file__), "data"),
+                    split="train",
+                    bn_calib_batches=bn_calib_batches,
+                )
+                val_loss, val_acc, _ = ModelTest.evaluate_params(
+                    updated_params,
+                    model_name=model_name,
+                    dataset_name=dataset_name,
+                    batch_size=eval_batch_size,
+                    max_batches=eval_batches,
+                    data_root=os.path.join(os.path.dirname(__file__), "data"),
+                    split="val",
+                    bn_calib_batches=bn_calib_batches,
+                )
+                eval_history.append({
+                    "round": round_idx,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                })
+                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%")
+                metric = val_acc if not math.isnan(val_acc) else train_acc
+                if metric > best_metric:
+                    best_metric = metric
+                    best_params = list(updated_params)
+            except Exception as e:
+                print(f"[Eval][Round {round_idx}] 评估失败: {e}")
+        round_elapsed = time.time() - round_start
+        round_times.append(round_elapsed)
+        print(f"[Round {round_idx}] 用时 {round_elapsed:.2f}s")
 
+    total_elapsed = time.time() - total_start
     print("\n===== 全部轮次结束 =====")
     print(f"最终全局参数前5: {csp.global_params[:5]}")
     final_summary = _vector_summary(csp.global_params)
     print(
         f"最终参数统计: 均值={final_summary['mean']:.6f}, |max|={final_summary['abs_max']:.6f}"
     )
+    # 可选：最终明文推理评估（与 Train 同步：支持 BN 校准）
+    if eval_each_round:
+        try:
+            val_loss, val_acc, _ = ModelTest.evaluate_params(
+                csp.global_params,
+                model_name=model_name,
+                dataset_name=dataset_name,
+                batch_size=eval_batch_size,
+                max_batches=eval_batches,
+                data_root=os.path.join(os.path.dirname(__file__), "data"),
+                split="val",
+                bn_calib_batches=bn_calib_batches,
+            )
+            print(f"[Final Eval] Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%")
+        except Exception as e:
+            print(f"[Final Eval] 评估失败: {e}")
     # 保存最终全局参数
     try:
         os.makedirs("trainResult", exist_ok=True)
-        model_tag = model_name.lower().replace(" ", "_")
-        dataset_tag = dataset_name.lower().replace(" ", "_")
-        result_path = os.path.join("trainResult", f"{model_tag}_{dataset_tag}_global_params_round{num_rounds}.json")
+        result_path = os.path.join("trainResult", f"{run_tag}_params.json")
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump({
                 "rounds": num_rounds,
@@ -278,6 +387,19 @@ def run_federated_simulation(
                 "dataset_name": dataset_name,
             }, f)
         print(f"全局参数已保存至: {result_path}")
+        # 保存最优参数（如评估开启）
+        if best_params is not None:
+            best_path = os.path.join("trainResult", f"{run_tag}_best_params.json")
+            with open(best_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "rounds": num_rounds,
+                    "model_size": len(best_params),
+                    "params": best_params,
+                    "model_name": model_name,
+                    "dataset_name": dataset_name,
+                    "best_metric": best_metric,
+                }, f)
+            print(f"最优全局参数已保存至: {best_path}")
     except Exception as e:
         print(f"保存全局参数失败: {e}")
     # 汇总各轮指标
@@ -289,24 +411,65 @@ def run_federated_simulation(
                 f"cos(prev)={stat['cos']:.6f}, 均值={stat['mean']:.6f}, |max|={stat['abs_max']:.6f}, "
                 f"proxy_loss={stat['proxy_loss']:.6e}"
             )
+    # 记录日志到 txt（时间、评估、收敛）
+    try:
+        log_path = os.path.join("trainResult", f"{run_tag}_log.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"总用时: {total_elapsed:.2f}s\n")
+            f.write("按轮用时(s): " + ", ".join(f"{t:.2f}" for t in round_times) + "\n\n")
+            if eval_history:
+                f.write("评估指标（train/val）:\n")
+                for ev in eval_history:
+                    f.write(
+                        f"Round {ev['round']}: Train loss={ev['train_loss']:.4f}, acc={ev['train_acc']*100:.2f}%; "
+                        f"Val loss={ev['val_loss']:.4f}, acc={ev['val_acc']*100:.2f}%\n"
+                    )
+                f.write("\n")
+            if round_stats:
+                f.write("收敛指标（ΔL2, ΔL∞）:\n")
+                for stat in round_stats:
+                    f.write(
+                        f"Round {stat['round']}: ΔL2={stat['delta_l2']:.6f}, Δ∞={stat['delta_inf']:.6f}, "
+                        f"cos(prev)={stat['cos']:.6f}, 均值={stat['mean']:.6f}, |max|={stat['abs_max']:.6f}, "
+                        f"proxy_loss={stat['proxy_loss']:.6e}\n"
+                    )
+            print(f"日志已保存: {log_path}")
+    except Exception as e:
+        print(f"保存日志失败: {e}")
 
 
 if __name__ == "__main__":
-    # 示例：2 轮，5 个 DO；第 2 轮让 DO2 掉线，DO1 做 Lie Attack（放大 1.2）
+    parser = argparse.ArgumentParser(description="联邦学习模拟（加密流程），可选初始参数与 BN 校准")
+    parser.add_argument("--initial-params-path", type=str, default=None,help="可选初始全局参数文件路径")
+    parser.add_argument("--bn-calib-batches", type=int, default=30, help="评估时 BN 校准用的训练批次数（仅 ResNet 有效）")
+    # 以下保持原默认示例参数，可按需扩展更多 CLI
+    parser.add_argument("--num-rounds", type=int, default=20)
+    parser.add_argument("--num-do", type=int, default=10)
+    parser.add_argument("--model-size", type=int, default=56714)  # cnn:56714 / lenet:81086 / resnet20:272186
+    parser.add_argument("--model-name", type=str, default="cnn")#cnn /lenet /resnet20
+    parser.add_argument("--dataset-name", type=str, default="mnist")#mnist /cifar10
+    parser.add_argument("--train-batch-size", type=int, default=64)
+    parser.add_argument("--train-max-batches", type=int, default=300)
+    parser.add_argument("--eval-each-round", dest="eval_each_round", action="store_true", default=True, help="开启每轮明文评估（会额外耗时，默认开启）")
+    parser.add_argument("--no-eval-each-round", dest="eval_each_round", action="store_false", help="关闭每轮明文评估")
+    parser.add_argument("--eval-batch-size", type=int, default=256)
+    parser.add_argument("--eval-batches", type=int, default=50)
+    args = parser.parse_args()
+
     run_federated_simulation(
-        num_rounds=10,
-        num_do=5,
-        model_size=83126,
-        orthogonal_vector_count=1_024,
+        num_rounds=args.num_rounds,
+        num_do=args.num_do,
+        model_size=args.model_size,
+        orthogonal_vector_count=2_048,
         bit_length=512,
         precision=10 ** 6,
-        # attack_type= "signflip",
-        # dropouts={1: [2]},
-        # attack_round=1,
-        # attack_do_id=4,
-        # attack_lambda=0.4,
-        model_name="lenet",
-        dataset_name="cifar10",
-        train_batch_size=128,
-        train_max_batches=400,
+        model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        train_batch_size=args.train_batch_size,
+        train_max_batches=args.train_max_batches,
+        initial_params_path=args.initial_params_path,
+        bn_calib_batches=args.bn_calib_batches,
+        eval_each_round=args.eval_each_round,
+        eval_batch_size=args.eval_batch_size,
+        eval_batches=args.eval_batches,
     )

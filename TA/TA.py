@@ -85,6 +85,19 @@ class TA:
         self.orthogonal_vectors_for_csp: List[List[float]] = []
         self.orthogonal_vectors_for_do: List[List[float]] = []
         self.orthogonal_sumvectors_for_csp: List[float] = []
+        #性能优化方案
+                # --------- 内部用 NumPy 存储，避免 Python list 巨额开销（对外接口不变）---------
+        self._orthogonal_vectors_np = None          # shape: (k, d)
+        self._orthogonal_vectors_for_csp_np = None  # shape: (k, d)
+        self._orthogonal_vectors_for_do_np = None   # shape: (k, d)
+        self._orthogonal_sumvectors_for_csp_np = None  # shape: (d,)
+
+        # 懒转换缓存：仅当 getter 被调用时才生成 list
+        self._orthogonal_vectors_list_cache = None
+        self._orthogonal_vectors_for_csp_list_cache = None
+        self._orthogonal_vectors_for_do_list_cache = None
+        self._orthogonal_sumvectors_for_csp_list_cache = None
+
 
         # 轮次管理
         self.current_round: int = 0
