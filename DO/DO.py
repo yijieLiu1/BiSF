@@ -852,6 +852,47 @@ class DO:
         target[chosen] = target_label
         return int(chosen.numel())
 
+    def _apply_backdoor_trigger(
+        self,
+        data: "torch.Tensor",
+        target: "torch.Tensor",
+        bd_cfg: Dict[str, object],
+    ) -> int:
+        """
+        All-to-one BadNets：随机抽取批次中一定比例样本，加触发器并改为目标标签。
+        Returns: 实际注入的样本数。
+        """
+
+        if not bd_cfg or not bd_cfg.get("bd_enable"):
+            return 0
+        if bd_cfg.get("bd_target_label") is None:
+            return 0
+        tgt = int(bd_cfg.get("bd_target_label"))
+        ratio = float(bd_cfg.get("bd_ratio", 1.0))
+        ratio = min(max(ratio, 0.0), 1.0)
+        if ratio <= 0.0:
+            return 0
+
+        batch_size = target.size(0)
+        num_poison = max(1, int(math.ceil(batch_size * ratio)))
+
+        if self._torch_rng is None:
+            self._torch_rng = torch.Generator(device=target.device)
+            self._torch_rng.manual_seed(12345 + self.id)
+
+        chosen = torch.randperm(batch_size, device=target.device, generator=self._torch_rng)[:num_poison]
+
+        # 触发器：在右下角放置 size×size 方块，像素值 trigger_value
+        size = int(bd_cfg.get("bd_trigger_size", 3))
+        val = float(bd_cfg.get("bd_trigger_value", 1.0))
+        h = data.size(-2)
+        w = data.size(-1)
+        hs = max(1, min(size, h))
+        ws = max(1, min(size, w))
+        data[chosen, :, h - hs : h, w - ws : w] = val
+        target[chosen] = tgt
+        return int(chosen.numel())
+
     # ============== 本地训练（模拟CNN） ==============
     def _local_train(self, global_params: List[float]) -> List[float]:
         """
@@ -905,17 +946,28 @@ class DO:
         batches_processed = 0
         current_round = len(self.training_history) + 1
         is_label_flip_round = self._should_label_flip(current_round)
+        bd_cfg = self.attack_config if self.attack_config else {}
+        bd_logged = False
 
         for batch_idx, (data, target) in enumerate(train_loader):
             if batch_idx >= self.max_batches:
                 break
             data = data.to(self.device)
             target = target.to(self.device)
+            # backdoor 注入（独立于 label_flip）
+            bd_applied = 0
+            if bd_cfg.get("bd_enable") and bd_cfg.get("bd_target_label") is not None and float(bd_cfg.get("bd_ratio", 0.0)) > 0.0:
+                data = data.clone()
+                target = target.clone()
+                bd_applied = self._apply_backdoor_trigger(data, target, bd_cfg)
             if is_label_flip_round:
                 target = target.clone()
                 flipped = self._apply_label_flip(target)
                 if flipped > 0 and batch_idx == 0:
                     print(f"[DO {self.id}] Round {current_round} label_flip 生效，batch0 换标签 {flipped} 条")
+            if bd_applied > 0 and not bd_logged:
+                print(f"[DO {self.id}] Round {current_round} backdoor 生效，batch{batch_idx} 注入 {bd_applied} 条")
+                bd_logged = True
 
             optimizer.zero_grad()
             output = model(data)

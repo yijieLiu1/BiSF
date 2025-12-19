@@ -90,50 +90,26 @@ def main() -> None:
     parser.add_argument("--dataset-name", type=str, default="mnist", help="数据集名称（mnist/cifar10）")
     parser.add_argument("--batch-size", type=int, default=64, help="训练批大小")
     parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
-    parser.add_argument(
-        "--partition-mode",
-        type=str,
-        default="iid",
-        help="数据划分模式：iid / mild / extreme（控制各 DO 训练数据的 IID/non-IID 程度）",
-    )
+    parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 训练数据的 IID/non-IID 程度）",)
     # target label flip 投毒设置（与 Test.py 对齐）
-    parser.add_argument(
-        "--poison-do-id",
-        type=str,
-        default="0,1,2",
-        help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",
-    )
-    parser.add_argument("--source-label", type=int, default=1, help="若需 label flip，指定源标签")
-    parser.add_argument("--target-label", type=int, default=99, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
-    parser.add_argument(
-        "--attack-rounds",
-        type=str,
-        default="all",
-        help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发",
-    )
-    parser.add_argument(
-        "--poison-ratio",
-        type=float,
-        default=1.0,
-        help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）",
-    )
+    parser.add_argument("--poison-do-id",type=str,default="0,1,2",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
+    parser.add_argument("--source-label", type=int, default=None, help="若需 label flip，指定源标签")
+    parser.add_argument("--target-label", type=int, default=None, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
+    parser.add_argument("--attack-rounds",type=str,default="all",help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发",)
+    parser.add_argument("--poison-ratio",type=float,default=1.0,help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）",)
     # untarget 梯度/参数投毒设置（stealth/random/signflip/lie_stat）
     parser.add_argument("--attack-type", type=str, default=None, help="untarget 投毒类型（stealth/random/signflip/lie_stat）")
-    parser.add_argument(
-        "--attack-round-untarget",
-        type=str,
-        default=None,
-        help="untarget 投毒触发轮次：单个数字、逗号列表或 all；留空则不触发",
-    )
+    parser.add_argument("--attack-round-untarget", type=str,default=None,help="untarget 投毒触发轮次：单个数字、逗号列表或 all；留空则不触发",)
     parser.add_argument("--attack-lambda", type=float, default=0.25, help="投毒放大系数")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="随机投毒的标准差")
+    # backdoor (BadNets-style) 配置
+    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=True,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
+    parser.add_argument("--bd-target-label", type=int, default=9, help="backdoor 目标标签")
+    parser.add_argument("--bd-ratio", type=float, default=0.4, help="backdoor 在源标签样本中的注入比例")
+    parser.add_argument("--bd-trigger-size", type=int, default=3, help="触发器方块尺寸（像素）")
+    parser.add_argument("--bd-trigger-value", type=float, default=3.0, help="触发器像素值（归一化前）")
     #结果保存（Plain 明文训练结果，文件名中带 plain 以便区分加密版本）
-    parser.add_argument(
-        "--save-path",
-        type=str,
-        default=None,
-        help="保存目录（默认按 {model}_{dataset}_{numdo}do_{attack}_{rounds}r_plain 自动生成）",
-    )
+    parser.add_argument("--save-path",type=str,default=None,help="保存目录（默认按 {model}_{dataset}_{numdo}do_{attack}_{rounds}r_plain 自动生成）",)
     parser.add_argument("--initial-params-path", type=str, default=None, help="trainResult/do_train_params.json")
     #模型推理测试
     parser.add_argument("--eval-batch-size", type=int, default=256, help="每轮推理评估批大小")
@@ -178,17 +154,11 @@ def main() -> None:
     csp_detector = CSP(ta, model_size=model_size, precision=10 ** 6, initial_params_path=None)
 
     # 构建 DO 列表（明文训练），同步 Test.py 的 label flip 配置
-    do_list = [
-        DO(
-            i,
-            ta,
-            model_size=model_size,
-            model_name=args.model_name,
-            dataset_name=args.dataset_name,
-            batch_size=args.batch_size,
-            max_batches=args.max_batches,
-            partition_mode=args.partition_mode,
-            attack_config=(
+    do_list = []
+    for i in range(args.num_do):
+        attack_cfg: Dict[str, object] = {}
+        if args.source_label is not None and args.target_label is not None and i in poison_do_ids:
+            attack_cfg.update(
                 {
                     "attack_type": "label_flip",
                     "attacker_do_id": i,
@@ -197,12 +167,30 @@ def main() -> None:
                     "target_label": args.target_label,
                     "poison_ratio": args.poison_ratio,
                 }
-                if (args.source_label is not None and args.target_label is not None and i in poison_do_ids)
-                else None
-            ),
+            )
+        if args.bd_enable and args.bd_target_label is not None and i in poison_do_ids:
+            attack_cfg.update(
+                {
+                    "bd_enable": True,
+                    "bd_target_label": args.bd_target_label,
+                    "bd_ratio": args.bd_ratio,
+                    "bd_trigger_size": args.bd_trigger_size,
+                    "bd_trigger_value": args.bd_trigger_value,
+                }
+            )
+        do_list.append(
+            DO(
+                i,
+                ta,
+                model_size=model_size,
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                batch_size=args.batch_size,
+                max_batches=args.max_batches,
+                partition_mode=args.partition_mode,
+                attack_config=attack_cfg if attack_cfg else None,
+            )
         )
-        for i in range(args.num_do)
-    ]
 
     # 初始全局参数
     global_params = load_initial_params(args.initial_params_path, model_size)
@@ -338,7 +326,7 @@ def main() -> None:
         print(f"[Train] 全局参数前5项: {global_params[:5]}")
         # 训练/验证评估
         try:
-            train_loss, train_acc, tb, train_asr, train_src_acc = ModelTest.evaluate_params(
+            train_loss, train_acc, tb, train_asr, train_src_acc, train_bd_asr = ModelTest.evaluate_params(
                 global_params,
                 model_name=args.model_name,
                 dataset_name=args.dataset_name,
@@ -349,8 +337,12 @@ def main() -> None:
                 bn_calib_batches=args.bn_calib_batches,
                 source_label=args.source_label,
                 target_label=args.target_label,
+                bd_target_label=args.bd_target_label if args.bd_enable else None,
+                bd_trigger_size=args.bd_trigger_size,
+                bd_trigger_value=args.bd_trigger_value,
+                bd_inject_ratio=args.bd_ratio if args.bd_enable else 0.0,
             )
-            val_loss, val_acc, vb, val_asr, val_src_acc = ModelTest.evaluate_params(
+            val_loss, val_acc, vb, val_asr, val_src_acc, val_bd_asr = ModelTest.evaluate_params(
                 global_params,
                 model_name=args.model_name,
                 dataset_name=args.dataset_name,
@@ -361,15 +353,23 @@ def main() -> None:
                 bn_calib_batches=args.bn_calib_batches,
                 source_label=args.source_label,
                 target_label=args.target_label,
+                bd_target_label=args.bd_target_label if args.bd_enable else None,
+                bd_trigger_size=args.bd_trigger_size,
+                bd_trigger_value=args.bd_trigger_value,
+                bd_inject_ratio=args.bd_ratio if args.bd_enable else 0.0,
             )
-            train_metric_history.append({"round": r, "loss": train_loss, "acc": train_acc, "asr": train_asr, "src_acc": train_src_acc})
-            val_metric_history.append({"round": r, "loss": val_loss, "acc": val_acc, "asr": val_asr, "src_acc": val_src_acc})
+            train_metric_history.append({"round": r, "loss": train_loss, "acc": train_acc, "asr": train_asr, "src_acc": train_src_acc, "bd_asr": train_bd_asr})
+            val_metric_history.append({"round": r, "loss": val_loss, "acc": val_acc, "asr": val_asr, "src_acc": val_src_acc, "bd_asr": val_bd_asr})
             extra_train = ""
             extra_val = ""
             if train_asr is not None and train_src_acc is not None:
                 extra_train = f", ASR(s->{args.target_label})={train_asr*100:.2f}%, src_acc={train_src_acc*100:.2f}%"
+            if train_bd_asr is not None:
+                extra_train += f", bd_ASR={train_bd_asr*100:.2f}%"
             if val_asr is not None and val_src_acc is not None:
                 extra_val = f", ASR(s->{args.target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
+            if val_bd_asr is not None:
+                extra_val += f", bd_ASR={val_bd_asr*100:.2f}%"
             print(f"[Eval][Round {r}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% (batches {tb}){extra_train}")
             print(f"[Eval][Round {r}] Val   loss={val_loss:.4f}, acc={val_acc*100:.2f}% (batches {vb}){extra_val}")
             # 记录最优（按 val acc，否则按 train acc）
@@ -388,6 +388,8 @@ def main() -> None:
     dataset_tag = args.dataset_name.lower()
     if args.attack_type:
         attack_tag = args.attack_type.lower()
+    elif args.bd_enable:
+        attack_tag = "backdoor"
     elif poison_do_ids:
         attack_tag = "label-flip"
     else:
@@ -414,6 +416,11 @@ def main() -> None:
                 "attack_sigma": args.attack_sigma,
                 "source_label": args.source_label,
                 "target_label": args.target_label,
+                "bd_enable": args.bd_enable,
+                "bd_target_label": args.bd_target_label,
+                "bd_ratio": args.bd_ratio,
+                "bd_trigger_size": args.bd_trigger_size,
+                "bd_trigger_value": args.bd_trigger_value,
             }
         ),
         encoding="utf-8",
@@ -453,8 +460,12 @@ def main() -> None:
                 extra_val = ""
                 if tm.get("asr") is not None and tm.get("src_acc") is not None:
                     extra_train = f", ASR={tm['asr']*100:.2f}%, src_acc={tm['src_acc']*100:.2f}%"
+                if tm.get("bd_asr") is not None:
+                    extra_train += f", bd_ASR={tm['bd_asr']*100:.2f}%"
                 if vm.get("asr") is not None and vm.get("src_acc") is not None:
                     extra_val = f", ASR={vm['asr']*100:.2f}%, src_acc={vm['src_acc']*100:.2f}%"
+                if vm.get("bd_asr") is not None:
+                    extra_val += f", bd_ASR={vm['bd_asr']*100:.2f}%"
                 f.write(
                     f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}%{extra_train} | "
                     f"Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%{extra_val}\n"
@@ -477,16 +488,20 @@ def main() -> None:
         print("\n===== 收敛指标汇总（相邻轮差） =====")
         for item in convergence_history:
             print(f"Round {item['round']}: L2={item['l2']:.6f}, L∞={item['linf']:.6f}")
-    if train_metric_history and val_metric_history:
-        print("\n===== 训练/验证指标汇总（按轮） =====")
-        for tm, vm in zip(train_metric_history, val_metric_history):
-            extra_train = ""
-            extra_val = ""
-            if tm.get("asr") is not None and tm.get("src_acc") is not None:
-                extra_train = f", ASR={tm['asr']*100:.2f}%, src_acc={tm['src_acc']*100:.2f}%"
-            if vm.get("asr") is not None and vm.get("src_acc") is not None:
-                extra_val = f", ASR={vm['asr']*100:.2f}%, src_acc={vm['src_acc']*100:.2f}%"
-            print(f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}%{extra_train} | Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%{extra_val}")
+        if train_metric_history and val_metric_history:
+            print("\n===== 训练/验证指标汇总（按轮） =====")
+            for tm, vm in zip(train_metric_history, val_metric_history):
+                extra_train = ""
+                extra_val = ""
+                if tm.get("asr") is not None and tm.get("src_acc") is not None:
+                    extra_train = f", ASR={tm['asr']*100:.2f}%, src_acc={tm['src_acc']*100:.2f}%"
+                if tm.get("bd_asr") is not None:
+                    extra_train += f", bd_ASR={tm['bd_asr']*100:.2f}%"
+                if vm.get("asr") is not None and vm.get("src_acc") is not None:
+                    extra_val = f", ASR={vm['asr']*100:.2f}%, src_acc={vm['src_acc']*100:.2f}%"
+                if vm.get("bd_asr") is not None:
+                    extra_val += f", bd_ASR={vm['bd_asr']*100:.2f}%"
+                print(f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}%{extra_train} | Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%{extra_val}")
 
 
 if __name__ == "__main__":

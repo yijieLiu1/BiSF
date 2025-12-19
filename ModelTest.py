@@ -10,7 +10,7 @@ import os
 import json
 import argparse
 from typing import Optional
-
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -226,16 +226,100 @@ def evaluate_targeted(model: nn.Module, loader, max_batches: int, source_label: 
     return avg_loss, acc, batches, asr, src_acc
 
 
-def evaluate_params(params, model_name: str, dataset_name: str, batch_size: int = 256, max_batches: int = 100, data_root: str = None, split: str = "val", bn_calib_batches: int = 0, source_label: Optional[int] = None, target_label: Optional[int] = None):
-    """供 Train 复用：直接对内存参数向量做评估；必要时先做 BN 校准；可选 label flip 指标"""
+def _apply_trigger(data: torch.Tensor, idx: torch.Tensor, trigger_size: int = 3, trigger_value: float = 1.0) -> None:
+    """在指定样本上，右下角放置触发器（方块）"""
+    if idx.numel() == 0:
+        return
+    h = data.size(-2)
+    w = data.size(-1)
+    hs = max(1, min(trigger_size, h))
+    ws = max(1, min(trigger_size, w))
+    data[idx, :, h - hs : h, w - ws : w] = trigger_value
+
+
+def evaluate_backdoor(
+    model: nn.Module,
+    loader,
+    max_batches: int,
+    target_label: int,
+    trigger_size: int = 3,
+    trigger_value: float = 3.0,
+    inject_ratio: float = 1.0,
+):
+    """BadNets-style 后门评估：随机抽取部分样本加触发器，统计预测为目标标签的比例（bd_ASR）"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    total = 0
+    success = 0
+    batches = 0
+
+    with torch.no_grad():
+        for data, target in loader:
+            if batches >= max_batches:
+                break
+            data = data.to(device)
+            target = target.to(device)
+            batch_size = target.size(0)
+            ratio = min(max(inject_ratio, 0.0), 1.0)
+            take = max(1, int(math.ceil(batch_size * ratio))) if ratio > 0 else 0
+            if take > 0:
+                idx = torch.randperm(batch_size, device=device)[:take]
+                _apply_trigger(data, idx, trigger_size=trigger_size, trigger_value=trigger_value)
+                logits = model(data)
+                preds = logits.argmax(dim=1)
+                total += idx.numel()
+                success += (preds[idx] == target_label).sum().item()
+            else:
+                logits = model(data)
+            batches += 1
+
+    bd_asr = success / max(1, total)
+    return bd_asr, batches
+
+
+
+def evaluate_params(
+    params,
+    model_name: str,
+    dataset_name: str,
+    batch_size: int = 256,
+    max_batches: int = 100,
+    data_root: str = None,
+    split: str = "val",
+    bn_calib_batches: int = 0,
+    source_label: Optional[int] = None,
+    target_label: Optional[int] = None,
+    bd_target_label: Optional[int] = None,
+    bd_trigger_size: int = 3,
+    bd_trigger_value: float = 1.0,
+    bd_inject_ratio: float = 1.0,
+):
+    """?Train ????????????????????? BN ????? label flip / backdoor ??"""
     model = build_model(params, model_name=model_name, dataset_name=dataset_name)
     if _needs_bn_calib(model_name) and bn_calib_batches > 0:
         recalibrate_bn(model, dataset_name, data_root or os.path.join(os.path.dirname(__file__), "data"), max_batches=bn_calib_batches)
     loader, max_batches = get_eval_loader(dataset_name, split=split, batch_size=batch_size, max_batches=max_batches, data_root=data_root)
     if source_label is not None and target_label is not None:
-        return evaluate_targeted(model, loader, max_batches, int(source_label), int(target_label))
-    loss, acc, batches = evaluate(model, loader, max_batches)
-    return loss, acc, batches, None, None
+        loss, acc, batches, asr, src_acc = evaluate_targeted(model, loader, max_batches, int(source_label), int(target_label))
+    else:
+        loss, acc, batches = evaluate(model, loader, max_batches)
+        asr = src_acc = None
+
+    bd_asr = None
+    if bd_target_label is not None:
+        bd_asr, _ = evaluate_backdoor(
+            model,
+            loader,
+            max_batches,
+            int(bd_target_label),
+            trigger_size=bd_trigger_size,
+            trigger_value=bd_trigger_value,
+            inject_ratio=bd_inject_ratio,
+        )
+    return loss, acc, batches, asr, src_acc, bd_asr
+
 
 
 def main():
