@@ -45,10 +45,23 @@ class DO:
     _DEFAULT_BATCH_SIZE = 64
     _DEFAULT_MAX_BATCHES = 100  # 每轮训练最多使用的 batch 数，避免过慢
     _data_loader_cache: Dict[str, DataLoader] = {}
+    # 训练数据按 DO 均分后的索引缓存：key -> List[List[int]]（长度=num_do，每个元素是一份 shard）
+    _sharded_indices_cache: Dict[str, List[List[int]]] = {}
 
-    def __init__(self, do_id: int, ta, model_size: int = 10000, precision: int = 10 ** 6, rng_seed: Optional[int] = None,
-                 model_name: str = "lenet", dataset_name: str = "cifar10", batch_size: Optional[int] = None,
-                 max_batches: Optional[int] = None):
+    def __init__(
+        self,
+        do_id: int,
+        ta,
+        model_size: int = 10000,
+        precision: int = 10 ** 6,
+        rng_seed: Optional[int] = None,
+        model_name: str = "lenet",
+        dataset_name: str = "cifar10",
+        batch_size: Optional[int] = None,
+        max_batches: Optional[int] = None,
+        attack_config: Optional[Dict[str, Any]] = None,
+        partition_mode: str = "iid",
+    ):
         """
         初始化DO
         Args:
@@ -89,11 +102,23 @@ class DO:
         self.batch_size = batch_size if batch_size is not None else self._DEFAULT_BATCH_SIZE
         self.max_batches = max_batches if max_batches is not None else self._DEFAULT_MAX_BATCHES
         self.data_root = self._DATA_ROOT
+        self.attack_config: Dict[str, Any] = attack_config or {}
+        meta_info = self._get_dataset_meta(self.dataset_name)
+        self.num_classes: int = meta_info.get("num_classes", 10)
+        # 用于“翻转到不存在标签”时在交叉熵中忽略这些样本
+        self._ignore_label: int = max(255, self.num_classes)
+        # 数据划分模式：iid / mild / extreme
+        mode = (partition_mode or "iid").lower()
+        if mode not in ("iid", "mild", "extreme"):
+            mode = "iid"
+        self.partition_mode: str = mode
 
         # 持久化模型/优化器（仅在 resnet 系列下复用，避免 BN 统计重置）
         self._persist_model = None
         self._persist_optimizer = None
         self._persist_scheduler = None
+        # 每个 DO 自己的 DataLoader（使用各自固定的数据子集）
+        self._train_loader: Optional[DataLoader] = None
 
         # 初始化 CNN 相关组件
         self._check_torch_available()
@@ -101,7 +126,9 @@ class DO:
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
             print(f"[DO {self.id}] 使用 GPU: {torch.cuda.get_device_name(self.device)}")
-        
+        poison_seed = self.attack_config.get("poison_seed", rng_seed if rng_seed is not None else (12345 + do_id))
+        self._torch_rng = torch.Generator(device=self.device)
+        self._torch_rng.manual_seed(int(poison_seed) & 0xFFFFFFFF)
         print(f"[DO {self.id}] 初始化完成，模型大小: {self.model_size}, 精度: {self.precision}")
 
         # 对 ResNet 系列，在设备初始化之后再创建持久化模型/优化器，避免 device 未就绪
@@ -122,10 +149,12 @@ class DO:
             return {
                 "name": "mnist",
                 "dataset_cls": datasets.MNIST,
+                # 标准 LeNet-5 使用 1×32×32 输入，这里通过 Pad(2) 将 28×28 扩展为 32×32
                 "in_channels": 1,
-                "input_size": 28,
+                "input_size": 32,
                 "num_classes": 10,
                 "transform": transforms.Compose([
+                    transforms.Pad(2),
                     transforms.ToTensor(),
                     transforms.Normalize((0.1307,), (0.3081,))
                 ]),
@@ -194,6 +223,242 @@ class DO:
         cls._data_loader_cache[cache_key] = loader
         return loader
 
+    @classmethod
+    def _build_label_buckets(
+        cls,
+        dataset,
+        full_idx_shuffled: List[int],
+        num_classes: int,
+    ) -> List[List[int]]:
+        """根据标签将索引分桶，用于 non-IID 划分。"""
+        # 获取标签序列（兼容 MNIST/CIFAR 的常用属性）
+        if hasattr(dataset, "targets"):
+            labels_seq = list(dataset.targets)
+        elif hasattr(dataset, "train_labels"):
+            labels_seq = list(dataset.train_labels)
+        else:
+            labels_seq = []
+            for i in range(len(dataset)):
+                _, y = dataset[i]
+                labels_seq.append(int(y))
+        buckets: List[List[int]] = [[] for _ in range(num_classes)]
+        for idx in full_idx_shuffled:
+            y = int(labels_seq[idx])
+            if 0 <= y < num_classes:
+                buckets[y].append(idx)
+        return buckets
+
+    @classmethod
+    def _build_shards_iid(
+        cls,
+        full_idx: List[int],
+        num_do: int,
+        seed: int = 2025,
+    ) -> List[List[int]]:
+        """IID 划分：整体打乱后按 DO 等分。"""
+        rnd = random.Random(seed)
+        full_idx_shuffled = list(full_idx)
+        rnd.shuffle(full_idx_shuffled)
+        total = len(full_idx_shuffled)
+        base = total // num_do
+        rem = total % num_do
+        shards: List[List[int]] = []
+        start = 0
+        for i in range(num_do):
+            extra = 1 if i < rem else 0
+            end = start + base + extra
+            shards.append(full_idx_shuffled[start:end])
+            start = end
+        return shards
+
+    @classmethod
+    def _build_shards_mild_non_iid(
+        cls,
+        full_idx: List[int],
+        dataset,
+        num_do: int,
+        num_classes: int,
+        alpha: float = 0.75,
+        seed: int = 2025,
+    ) -> List[List[int]]:
+        """
+        轻度 non-IID：每个 DO 偏好 2 个标签（样本约 75% 来自偏好标签，25% 来自其他标签），
+        同时不同 DO 的偏好标签不同。
+        """
+        rnd = random.Random(seed)
+        full_idx_shuffled = list(full_idx)
+        rnd.shuffle(full_idx_shuffled)
+        buckets = cls._build_label_buckets(dataset, full_idx_shuffled, num_classes)
+        # 每个 bucket 用指针避免重复使用样本
+        bucket_ptr = [0] * num_classes
+
+        total = len(full_idx_shuffled)
+        base = total // num_do
+        rem = total % num_do
+        shards: List[List[int]] = []
+
+        for i in range(num_do):
+            target_size = base + (1 if i < rem else 0)
+            if target_size <= 0:
+                shards.append([])
+                continue
+            # 偏好两个标签
+            primary_labels = [i % num_classes, (i + 1) % num_classes]
+            primary_quota = int(alpha * target_size)
+            assigned: List[int] = []
+
+            # 先从偏好标签中取
+            for lab in primary_labels:
+                while primary_quota > 0 and bucket_ptr[lab] < len(buckets[lab]):
+                    assigned.append(buckets[lab][bucket_ptr[lab]])
+                    bucket_ptr[lab] += 1
+                    primary_quota -= 1
+                if primary_quota == 0:
+                    break
+
+            # 若偏好桶不够，再从所有标签中补足
+            remaining = target_size - len(assigned)
+            if remaining > 0:
+                for lab in range(num_classes):
+                    while remaining > 0 and bucket_ptr[lab] < len(buckets[lab]):
+                        assigned.append(buckets[lab][bucket_ptr[lab]])
+                        bucket_ptr[lab] += 1
+                        remaining -= 1
+                    if remaining == 0:
+                        break
+
+            shards.append(assigned)
+
+        return shards
+
+    @classmethod
+    def _build_shards_extreme_non_iid(
+        cls,
+        full_idx: List[int],
+        dataset,
+        num_do: int,
+        num_classes: int,
+        seed: int = 2025,
+    ) -> List[List[int]]:
+        """
+        极端 non-IID：每个 DO 只拥有少数几个标签，其余标签完全缺失。
+        实现方式：
+        - 先为每个标签分桶
+        - 再将标签轮流分配给 DO（标签 -> DO 的映射）
+        - 每个 DO 只从其负责的标签桶中取样本
+        """
+        rnd = random.Random(seed)
+        full_idx_shuffled = list(full_idx)
+        rnd.shuffle(full_idx_shuffled)
+        buckets = cls._build_label_buckets(dataset, full_idx_shuffled, num_classes)
+        bucket_ptr = [0] * num_classes
+
+        # 标签 -> DO 的分配表（轮流分配）
+        labels_for_do: List[List[int]] = [[] for _ in range(num_do)]
+        cur = 0
+        for lab in range(num_classes):
+            labels_for_do[cur].append(lab)
+            cur = (cur + 1) % num_do
+
+        total = len(full_idx_shuffled)
+        base = total // num_do
+        rem = total % num_do
+        shards: List[List[int]] = []
+
+        for i in range(num_do):
+            target_size = base + (1 if i < rem else 0)
+            if target_size <= 0:
+                shards.append([])
+                continue
+            allowed_labels = labels_for_do[i] if labels_for_do[i] else list(range(num_classes))
+            assigned: List[int] = []
+            remaining = target_size
+
+            # 仅从自己负责的标签桶中取
+            while remaining > 0:
+                progress = False
+                for lab in allowed_labels:
+                    if remaining <= 0:
+                        break
+                    if bucket_ptr[lab] < len(buckets[lab]):
+                        assigned.append(buckets[lab][bucket_ptr[lab]])
+                        bucket_ptr[lab] += 1
+                        remaining -= 1
+                        progress = True
+                if not progress:
+                    # 自己负责的标签不够用了，停止（少量样本缺失可以接受）
+                    break
+
+            shards.append(assigned)
+
+        return shards
+
+    def _get_data_loader_for_do(self, dataset_name: str, batch_size: int, data_root: str) -> DataLoader:
+        """
+        为当前 DO 返回“固定子数据集”的 DataLoader：
+        - 先根据全局 train_idx 做一次随机打乱
+        - 再按 TA.num_do 均分成 num_do 份
+        - 第 i 个 DO（self.id=i）永远只使用自己这一份索引
+        这样可以模拟典型的联邦场景：每个 DO 拿到一个互不重叠、近似 IID 的数据子集。
+        """
+        name = dataset_name.lower()
+        meta = self._get_dataset_meta(dataset_name)
+        os.makedirs(data_root, exist_ok=True)
+
+        # 1) 构建完整训练集（官方二进制 + 统一 transform）
+        dataset = meta["dataset_cls"](
+            root=data_root,
+            train=True,
+            download=True,
+            transform=meta["transform"],
+        )
+
+        # 2) 读取 80% 训练索引（全局）
+        split_dir = os.path.join(data_root, "splits")
+        train_idx_path = os.path.join(split_dir, f"{name}_train_idx.json")
+        if not os.path.exists(train_idx_path):
+            raise FileNotFoundError(
+                f"[DO] 未找到训练索引 {train_idx_path}，请先运行 split_datasets.py 生成 80/20 拆分索引"
+            )
+        with open(train_idx_path, "r", encoding="utf-8") as f:
+            full_idx = json.load(f)
+
+        # 3) 按 DO 数量划分索引（IID / mild-non-IID / extreme-non-IID，带缓存）
+        num_do = getattr(self.ta, "num_do", 1)
+        mode = getattr(self, "partition_mode", "iid")
+        shard_cache_key = f"{name}_mode{mode}_n{num_do}_root{data_root}"
+        if shard_cache_key not in DO._sharded_indices_cache:
+            num_classes = meta["num_classes"]
+            if mode == "mild":
+                shards = DO._build_shards_mild_non_iid(
+                    full_idx, dataset, num_do=num_do, num_classes=num_classes, alpha=0.75, seed=2025
+                )
+            elif mode == "extreme":
+                shards = DO._build_shards_extreme_non_iid(
+                    full_idx, dataset, num_do=num_do, num_classes=num_classes, seed=2025
+                )
+            else:
+                shards = DO._build_shards_iid(full_idx, num_do=num_do, seed=2025)
+            DO._sharded_indices_cache[shard_cache_key] = shards
+
+        shards = DO._sharded_indices_cache[shard_cache_key]
+        do_id = int(self.id) if hasattr(self, "id") else 0
+        if do_id < 0 or do_id >= len(shards):
+            # 兜底：若 id 超界，回退到整集合
+            do_indices = full_idx
+        else:
+            do_indices = shards[do_id]
+
+        subset = Subset(dataset, do_indices)
+        loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=True,   # 仅在自己这份数据内部打乱
+            num_workers=0,
+            drop_last=True,
+        )
+        return loader
+
     class _SimpleMNISTCNN(nn.Module):
         def __init__(self, in_channels: int = 1, input_size: int = 28, num_classes: int = 10):
             super().__init__()
@@ -224,11 +489,25 @@ class DO:
             return x
 
     class _LeNet(nn.Module):
-        def __init__(self, in_channels: int = 3, input_size: int = 32, num_classes: int = 10):
+        """
+        经典 LeNet-5 结构（C1-S2-C3-S4-C5-F6 + 输出层）的简化实现：
+        - C1: conv 5x5, out_ch=6（无 padding）
+        - S2/S4: avg pool 2x2
+        - C3: conv 5x5, out_ch=16
+        - C5/F6: 全连接 120 -> 84 -> num_classes
+        激活函数使用原版的 Tanh。
+        """
+        def __init__(self, in_channels: int = 1, input_size: int = 32, num_classes: int = 10):
             super().__init__()
-            self.conv1 = nn.Conv2d(in_channels, 6, 5, padding=2)
-            self.pool = nn.AvgPool2d(2, 2)
-            self.conv2 = nn.Conv2d(6, 16, 5)
+            # C1: 5x5 conv, 无 padding（32x32 -> 28x28，28x28 -> 24x24 对于 28x28 输入）
+            self.conv1 = nn.Conv2d(in_channels, 6, kernel_size=5, padding=0)
+            # S2/S4: average pooling
+            self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+            # C3: 5x5 conv
+            self.conv2 = nn.Conv2d(6, 16, kernel_size=5, padding=0)
+            # 激活函数（需要在 _calc_flat_dim 中使用，因此提前定义）
+            self.act = nn.Tanh()
+            # 动态计算展平维度，兼容 28x28 / 32x32 输入
             flat_dim = self._calc_flat_dim(in_channels, input_size)
             self.fc1 = nn.Linear(flat_dim, 120)
             self.fc2 = nn.Linear(120, 84)
@@ -237,16 +516,16 @@ class DO:
         def _calc_flat_dim(self, in_channels: int, input_size: int) -> int:
             with torch.no_grad():
                 x = torch.zeros(1, in_channels, input_size, input_size)
-                x = self.pool(F.relu(self.conv1(x)))
-                x = self.pool(F.relu(self.conv2(x)))
+                x = self.pool(self.act(self.conv1(x)))
+                x = self.pool(self.act(self.conv2(x)))
                 return int(x.numel())
 
         def forward(self, x):
-            x = self.pool(F.relu(self.conv1(x)))
-            x = self.pool(F.relu(self.conv2(x)))
+            x = self.pool(self.act(self.conv1(x)))
+            x = self.pool(self.act(self.conv2(x)))
             x = torch.flatten(x, 1)
-            x = F.relu(self.fc1(x))
-            x = F.relu(self.fc2(x))
+            x = self.act(self.fc1(x))
+            x = self.act(self.fc2(x))
             x = self.fc3(x)
             return x
 
@@ -368,21 +647,27 @@ class DO:
             return x
 
     def _build_model(self, dataset_name: str) -> nn.Module:
+        """
+        构建本地模型：
+        - 目前仅保留两类网络：
+          * LeNet-5（标准 CNN，用于 MNIST / CIFAR 的轻量实验）
+          * ResNet20（标准 CIFAR ResNet-20）
+        其他结构暂不启用，避免配置过多带来困惑。
+        """
         meta = self._get_dataset_meta(dataset_name)
         in_channels = meta["in_channels"]
         input_size = meta["input_size"]
         num_classes = meta["num_classes"]
         name = self.model_name
-        if name in ("mnist_cnn", "cnn", "simple_cnn"):
-            return self._SimpleMNISTCNN(in_channels=in_channels, input_size=input_size, num_classes=num_classes)
-        if name in ("lenet", "lenet5", "lenet_cifar"):
+
+        # 将 "cnn"/"mnist_cnn"/"simple_cnn" 统一映射到标准 LeNet-5
+        if name in ("lenet", "lenet5", "lenet_cifar", "cnn", "mnist_cnn", "simple_cnn"):
             return self._LeNet(in_channels=in_channels, input_size=input_size, num_classes=num_classes)
-        if name in ("resnet18", "resnet18_cifar", "resnet_cifar"):
-            return self._ResNet18(in_channels=in_channels, num_classes=num_classes)
-        if name in ("resnet20", "resnet20_cifar"):
+
+        # 统一的 ResNet 入口：仅保留 ResNet20
+        if name in ("resnet20", "resnet20_cifar", "resnet"):
             return self._ResNet20(in_channels=in_channels, num_classes=num_classes)
-        if name in ("resnet_small", "resnet_tiny", "resnet18_small"):
-            return self._ResNetSmall(in_channels=in_channels, num_classes=num_classes)
+
         raise ValueError(f"不支持的模型: {self.model_name}")
     def _init_persistent_model(self) -> None:
         model = self._build_model(self.dataset_name).to(self.device)
@@ -515,6 +800,58 @@ class DO:
         self.round_private_key = pow(self.base_private_key, h, N2)
         print(f"[DO {self.id}] 派生密钥计算完成: {self.round_private_key}")
 
+    def _should_label_flip(self, round_idx: int) -> bool:
+        cfg = self.attack_config
+        if not cfg or cfg.get("attack_type") != "label_flip":
+            return False
+        attacker = cfg.get("attacker_do_id")
+        if attacker is not None and attacker != self.id:
+            return False
+        rounds = cfg.get("attack_rounds", "all")
+        if rounds in ("all", None):
+            return True
+        if isinstance(rounds, (list, tuple, set)):
+            return round_idx in rounds
+        return round_idx == rounds
+
+    def _apply_label_flip(self, target: "torch.Tensor") -> int:
+        cfg = self.attack_config
+        if cfg.get("attack_type") != "label_flip":
+            return 0
+        if "source_label" not in cfg or "target_label" not in cfg:
+            return 0
+        source_label = int(cfg.get("source_label"))
+        target_label = int(cfg.get("target_label"))
+        num_classes = getattr(self, "num_classes", 0)
+        ratio = float(cfg.get("poison_ratio", 0.3))
+        ratio = min(max(ratio, 0.0), 1.0)
+        if ratio <= 0.0 or source_label == target_label:
+            return 0
+        # 若目标标签超出类别范围：映射到一个随机有效标签（避免直接忽略，制造“混乱”梯度）
+        if target_label < 0 or target_label >= num_classes:
+            if self._torch_rng is None:
+                self._torch_rng = torch.Generator(device=target.device)
+                self._torch_rng.manual_seed(12345 + self.id)
+            target_label = torch.randint(
+                low=0,
+                high=max(1, num_classes),
+                size=(1,),
+                device=target.device,
+                generator=self._torch_rng,
+            ).item()
+            if num_classes > 1 and target_label == source_label:
+                target_label = (target_label + 1) % num_classes
+        src_indices = (target == source_label).nonzero(as_tuple=False).view(-1)
+        if src_indices.numel() == 0:
+            return 0
+        num_flip = max(1, math.ceil(src_indices.numel() * ratio))
+        if self._torch_rng is None:
+            self._torch_rng = torch.Generator(device=target.device)
+            self._torch_rng.manual_seed(12345 + self.id)
+        chosen = src_indices[torch.randperm(src_indices.numel(), device=target.device, generator=self._torch_rng)[:num_flip]]
+        target[chosen] = target_label
+        return int(chosen.numel())
+
     # ============== 本地训练（模拟CNN） ==============
     def _local_train(self, global_params: List[float]) -> List[float]:
         """
@@ -558,17 +895,27 @@ class DO:
                 print(f"[DO {self.id}] 全局参数近似全零，跳过覆盖，采用良好初始化以避免零梯度。")
         except Exception as e:
             print(f"[DO {self.id}] 应用全局参数初始化失败，将继续使用默认初始化: {e}")
-        loss_fn = nn.CrossEntropyLoss()
+        loss_fn = nn.CrossEntropyLoss(ignore_index=self._ignore_label)
 
-        train_loader = self._get_data_loader(dataset_name, self.batch_size, self.data_root)
+        # 为当前 DO 获取固定子数据集的 DataLoader（首轮构建后复用）
+        if self._train_loader is None:
+            self._train_loader = self._get_data_loader_for_do(dataset_name, self.batch_size, self.data_root)
+        train_loader = self._train_loader
         model.train()
         batches_processed = 0
+        current_round = len(self.training_history) + 1
+        is_label_flip_round = self._should_label_flip(current_round)
 
         for batch_idx, (data, target) in enumerate(train_loader):
             if batch_idx >= self.max_batches:
                 break
             data = data.to(self.device)
             target = target.to(self.device)
+            if is_label_flip_round:
+                target = target.clone()
+                flipped = self._apply_label_flip(target)
+                if flipped > 0 and batch_idx == 0:
+                    print(f"[DO {self.id}] Round {current_round} label_flip 生效，batch0 换标签 {flipped} 条")
 
             optimizer.zero_grad()
             output = model(data)

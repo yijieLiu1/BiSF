@@ -9,6 +9,7 @@
 import os
 import json
 import argparse
+from typing import Optional
 
 import torch
 from torch import nn
@@ -19,10 +20,12 @@ from torchvision import datasets, transforms
 from DO.DO import DO  # 复用模型定义
 
 # 支持的模型/数据集枚举
+# 目前仅保留两类：
+# - "cnn"/"lenet" -> 标准 LeNet-5（与 DO/Train/Test 中保持一致）
+# - "resnet20"    -> ResNet20（CIFAR 版本）
 MODEL_BUILDERS = {
-    "cnn": lambda ic, inp, nc: DO._SimpleMNISTCNN(in_channels=ic, input_size=inp, num_classes=nc),
+    "cnn":   lambda ic, inp, nc: DO._LeNet(in_channels=ic, input_size=inp, num_classes=nc),
     "lenet": lambda ic, inp, nc: DO._LeNet(in_channels=ic, input_size=inp, num_classes=nc),
-    "resnet18": lambda ic, _inp, nc: DO._ResNet18(in_channels=ic, num_classes=nc),
     "resnet20": lambda ic, _inp, nc: DO._ResNet20(in_channels=ic, num_classes=nc),
 }
 DATASET_CHOICES = {"mnist", "cifar10", "cifar100"}
@@ -107,6 +110,8 @@ def _get_test_transform(dataset_name: str):
     name = dataset_name.lower()
     if name == "mnist":
         return transforms.Compose([
+            # 与 DO._get_dataset_meta 保持一致：先 Pad 到 32×32，再归一化
+            transforms.Pad(2),
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])
@@ -177,13 +182,60 @@ def evaluate(model, loader, max_batches: int):
     return avg_loss, acc, batches
 
 
-def evaluate_params(params, model_name: str, dataset_name: str, batch_size: int = 256, max_batches: int = 100, data_root: str = None, split: str = "val", bn_calib_batches: int = 0):
-    """供 Train 复用：直接对内存参数向量做评估；必要时先做 BN 校准"""
+def evaluate_targeted(model: nn.Module, loader, max_batches: int, source_label: int, target_label: int):
+    """带 label flip 指标的评估：整体 acc + ASR + source-class acc"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    loss_fn = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    batches = 0
+    src_total = 0
+    flip_to_target = 0
+    src_correct = 0
+
+    with torch.no_grad():
+        for data, target in loader:
+            if batches >= max_batches:
+                break
+            data = data.to(device)
+            target = target.to(device)
+            logits = model(data)
+            loss = loss_fn(logits, target)
+            preds = logits.argmax(dim=1)
+
+            batch_size = target.size(0)
+            total_loss += loss.item() * batch_size
+            total_correct += (preds == target).sum().item()
+            total_samples += batch_size
+            batches += 1
+
+            mask = (target == source_label)
+            if mask.any():
+                src_total += mask.sum().item()
+                flip_to_target += (preds[mask] == target_label).sum().item()
+                src_correct += (preds[mask] == source_label).sum().item()
+
+    avg_loss = total_loss / max(1, total_samples)
+    acc = total_correct / max(1, total_samples)
+    asr = flip_to_target / max(1, src_total)
+    src_acc = src_correct / max(1, src_total)
+    return avg_loss, acc, batches, asr, src_acc
+
+
+def evaluate_params(params, model_name: str, dataset_name: str, batch_size: int = 256, max_batches: int = 100, data_root: str = None, split: str = "val", bn_calib_batches: int = 0, source_label: Optional[int] = None, target_label: Optional[int] = None):
+    """供 Train 复用：直接对内存参数向量做评估；必要时先做 BN 校准；可选 label flip 指标"""
     model = build_model(params, model_name=model_name, dataset_name=dataset_name)
     if _needs_bn_calib(model_name) and bn_calib_batches > 0:
         recalibrate_bn(model, dataset_name, data_root or os.path.join(os.path.dirname(__file__), "data"), max_batches=bn_calib_batches)
     loader, max_batches = get_eval_loader(dataset_name, split=split, batch_size=batch_size, max_batches=max_batches, data_root=data_root)
-    return evaluate(model, loader, max_batches)
+    if source_label is not None and target_label is not None:
+        return evaluate_targeted(model, loader, max_batches, int(source_label), int(target_label))
+    loss, acc, batches = evaluate(model, loader, max_batches)
+    return loss, acc, batches, None, None
 
 
 def main():
@@ -220,6 +272,18 @@ def main():
         default=0,
         help="BN 校准用的训练集 batch 数（仅 resnet 有效，0 表示不校准）",
     )
+    parser.add_argument(
+        "--source-label",
+        type=int,
+        default=None,
+        help="若需计算 label flip 指标，指定源标签",
+    )
+    parser.add_argument(
+        "--target-label",
+        type=int,
+        default=None,
+        help="若需计算 label flip 指标，指定目标标签",
+    )
     parser.add_argument("--batch-size", type=int, default=64, help="评估批大小")
     parser.add_argument("--max-batches", type=int, default=100, help="评估使用的批次数上限（减轻耗时）")
     args = parser.parse_args()
@@ -248,12 +312,21 @@ def main():
     )
     if _needs_bn_calib(model_name) and args.bn_calib_batches > 0:
         recalibrate_bn(model, dataset_name, args.test_data_root or os.path.join(os.path.dirname(__file__), "data"), max_batches=args.bn_calib_batches)
-    avg_loss, acc, used_batches = evaluate(model, loader, max_batches)
+    if args.source_label is not None and args.target_label is not None:
+        avg_loss, acc, used_batches, asr, src_acc = evaluate_targeted(
+            model, loader, max_batches, args.source_label, args.target_label
+        )
+    else:
+        avg_loss, acc, used_batches = evaluate(model, loader, max_batches)
+        asr = src_acc = None
 
     print("\n===== 推理评估结果 =====")
     print(f"使用批次数: {used_batches}")
     print(f"平均交叉熵损失: {avg_loss:.6f}")
     print(f"准确率: {acc * 100:.2f}%")
+    if asr is not None:
+        print(f"label_flip ASR (s={args.source_label} -> t={args.target_label}): {asr * 100:.2f}%")
+        print(f"source-class accuracy: {src_acc * 100:.2f}%")
 
 
 if __name__ == "__main__":

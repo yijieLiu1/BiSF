@@ -14,6 +14,8 @@ import random
 import math
 import json
 import argparse
+import io
+import contextlib
 from typing import Dict, List, Optional
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -24,43 +26,65 @@ from CSP.CSP import CSP
 from DO.DO import DO
 import ModelTest
 
-#默认参数。Test调用时还会传参
+# 默认参数。作为“库函数”时可单独调用；命令行入口会显式传入同名参数（保持默认值一致）。
 def run_federated_simulation(
-    num_rounds: int = 2,
-    num_do: int = 3,
+    num_rounds: int = 30,
+    num_do: int = 10,
     model_size: int = 10_000,
-    orthogonal_vector_count: int = 1_024,
+    orthogonal_vector_count: int = 2_048,
     bit_length: int = 512,
     precision: int = 10 ** 6,
     dropouts: Optional[Dict[int, List[int]]] = None,
     dropout_round: Optional[int] = None,
     dropout_do_ids: Optional[List[int]] = None,
+    # untarget 梯度/参数投毒的单轮触发配置
     attack_round: Optional[int] = None,
-    attack_do_id: Optional[int] = None,
-    #stealth隐蔽投毒，二分找到恶意DO / random随机数 / signflip反向梯度 /lie_stat放大梯度
-    attack_type: str = None,
+    attack_do_ids: Optional[List[int]] = None,
+    # stealth 隐蔽投毒 / random 随机噪声 / signflip 反向梯度 / lie_stat 统计型放大
+    # 注意：label flip 使用的是 DO 内部的 attack_config，与此处 attack_type 解耦。
+    attack_type: Optional[str] = None,
     attack_lambda: float = 0.2,
     attack_sigma: float = 1.0,
-    #模型名称和数据集名称："lenet/mnist_cnn","mnist/cifar10"
-    model_name: str = "mnist_cnn",
+    # 模型名称和数据集名称："lenet/mnist_cnn","cnn/mnist","lenet/cifar10" 等
+    model_name: str = "cnn",
     dataset_name: str = "mnist",
-    #DO训练的batch选项
-    train_batch_size: Optional[int] = None,
-    train_max_batches: Optional[int] = None,
-    #可选的模型参数，可以指定使用已训练过的全局模型参数作为初始参数：
-    initial_params_path="trainResult/lenet_cifar10_global_params_round10.json",
-    # initial_params_path: Optional[str] = None,
+    # DO 训练的 batch 选项
+    train_batch_size: Optional[int] = 64,
+    train_max_batches: Optional[int] = 300,
+    # 数据划分模式：iid / mild / extreme（控制各 DO 的本地数据分布）
+    partition_mode: str = "iid",
+    # 可选的模型参数，可以指定使用已训练过的全局模型参数作为初始参数：
+    initial_params_path: Optional[str] = None,
     # 评估相关：每轮在 train/val 上做推理（明文），可选 BN 校准（ResNet）
-    #是否每一轮都进行一次推理，查看准确率
+    # 是否每一轮都进行一次推理，查看准确率
     eval_each_round: bool = True,
     eval_batch_size: int = 256,
     eval_batches: int = 50,
-    bn_calib_batches: int = 0,
+    bn_calib_batches: int = 30,
+    # label flip 攻击配置（target 攻击）
+    source_label: Optional[int] = None,
+    target_label: Optional[int] = None,
+    attack_rounds: Optional[List[int]] = None,
+    poison_ratio: float = 0.3,
+    # untarget 梯度/参数投毒的轮次配置："all" / List[int] / 单个 int / None
+    attack_rounds_untarget: Optional[object] = "all",
 ) -> None:
     """
     运行一次联邦学习流程。
-    - dropouts / dropout_round+dropout_do_ids：配置掉线 DO
-    - attack_round/attack_do_id/attack_lambda：在指定轮次对指定 DO 进行 Lie Attack（基于自身梯度放大 1+lambda）
+
+    - dropouts / dropout_round + dropout_do_ids：配置掉线 DO
+    - label flip（目标攻击）：
+        * 通过 DO 内部的 attack_config 控制：
+          - attack_do_ids: 哪些 DO 做 label flip
+          - source_label / target_label / attack_rounds / poison_ratio
+    - untarget 梯度/参数投毒：
+        * 本文件内部在聚合前直接篡改明文更新：
+          - attack_type: stealth / random / signflip / lie_stat
+          - attack_do_ids: 哪些 DO 做 untarget 投毒
+          - attack_round / attack_rounds_untarget: 触发轮次
+
+    注意：同一个 attack_do_ids 列表同时被 label flip 和 untarget 两类攻击复用，
+    是否真正“生效”取决于是否同时满足各自所需的参数组合。
     """
     dropouts = dropouts or {}
     if dropout_round is not None and dropout_do_ids:
@@ -116,6 +140,8 @@ def run_federated_simulation(
         precision=precision,
     )
     csp = CSP(ta, model_size=model_size, precision=precision, initial_params_path=initial_params_path)
+    attack_do_ids = attack_do_ids or []
+
     do_list: List[Optional[DO]] = [
         DO(
             i,
@@ -126,48 +152,96 @@ def run_federated_simulation(
             dataset_name=dataset_name,
             batch_size=train_batch_size,
             max_batches=train_max_batches,
+            partition_mode=partition_mode,
+            attack_config=({
+                "attack_type": "label_flip",
+                "attacker_do_id": i,
+                "attack_rounds": attack_rounds if attack_rounds else "all",
+                "source_label": source_label,
+                "target_label": target_label,
+                "poison_ratio": poison_ratio,
+            } if (source_label is not None and target_label is not None and i in attack_do_ids) else None),
         )
         for i in range(num_do)
     ]
     round_stats: List[Dict[str, float]] = []
 
-    def run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> None:
+    def run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> str:
         if not vector_map:
-            return
+            return ""
         backup = None
         if temporary:
             backup = csp.do_projection_map
             csp.do_projection_map = {k: list(v) for k, v in vector_map.items()}
-        print(f"\n----- 投毒检测（{label}）-----")
-        active_count = len(csp.do_projection_map)
-        if active_count >= 2:
-            csp.detect_poison_multi_krum(f=1, alpha=1.5)
-            csp.detect_poison_geomedian(beta=1.5)
-            csp.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
-            csp.detect_poison_lasa_lite(angle_threshold=0.0, beta=1.5)
-        else:
-            print("[检测] 在线 DO 数不足，跳过。")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print(f"\n----- 投毒检测（{label}）-----")
+            active_count = len(csp.do_projection_map)
+            if active_count >= 2:
+                #将阈值缩小，更加敏感
+                #f：假定最多有多少恶意 DO（Multi‑Krum 专用）确保n>=2f+3
+                # alpha / beta：阈值敏感度系数（越小越“敏感”）
+                # k：聚类时的簇数
+                # angle_threshold：方向（余弦相似度）的下限阈值0.0，也就是只要方向不是完全“反着来”就不算太离谱；如果想更敏感，可以设为 0.2 / 0.3，表示“必须跟大多数方向比较接近”。
+                csp.detect_poison_multi_krum(f=2, alpha=1.5)
+                csp.detect_poison_geomedian(beta=1.5)
+                csp.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
+                csp.detect_poison_lasa_lite(angle_threshold=0.0, beta=1.5)
+            else:
+                print("[检测] 在线 DO 数不足，跳过。")
+        output = buf.getvalue()
+        print(output, end="")
         if temporary:
             csp.do_projection_map = backup
+        return output
 
     round_times = []
     eval_history: List[Dict[str, float]] = []
+    detection_logs_raw: List[Dict[str, str]] = []
+    detection_logs_proj: List[Dict[str, str]] = []
     best_params = None
     best_metric = -1.0  # 优先用 val acc，如果没有则用 train acc
     # 构造统一的运行标签：模型_数据集_do数_场景_轮数
     def _build_run_tag() -> str:
         model_tag = model_name.lower().replace(" ", "_")
         dataset_tag = dataset_name.lower().replace(" ", "_")
-        if attack_type and attack_round is not None:
-            scenario_tag = f"{attack_type.lower()}投毒加检测"
-        else:
-            scenario_tag = "正常"
-        scenario_tag = scenario_tag.replace(" ", "")
+        scenario_parts = []
+
+        # target 攻击（label flip）：只要配置了攻击 DO 且给出了源/目标标签，就认为开启
+        has_target_attack = bool(attack_do_ids) and source_label is not None and target_label is not None
+        # untarget 攻击（stealth/random/signflip/lie_stat）：只要 attack_type 与攻击 DO 同时非空，就认为开启
+        has_untarget_attack = bool(attack_do_ids) and bool(attack_type)
+
+        if has_target_attack:
+            if attack_rounds == "all":
+                scenario_parts.append("target_labelflip_all")
+            elif isinstance(attack_rounds, list) and attack_rounds:
+                scenario_parts.append(f"target_labelflip_{len(attack_rounds)}r")
+            else:
+                scenario_parts.append("target_labelflip")
+
+        if has_untarget_attack:
+            scenario_parts.append(f"untarget_{attack_type.lower()}")
+
+        scenario_tag = "_".join(scenario_parts) if scenario_parts else "normal"
         return f"{model_tag}_{dataset_tag}_{num_do}do_{scenario_tag}_{num_rounds}r"
 
     run_tag = _build_run_tag()
 
     total_start = time.time()
+
+    def _should_poison_round(round_idx: int, do_id: int) -> bool:
+        """untarget 梯度/参数投毒的触发判定：支持 all / 列表 / 单次"""
+        if not attack_type or do_id not in attack_do_ids:
+            return False
+        if attack_rounds_untarget == "all":
+            return True
+        if isinstance(attack_rounds_untarget, list):
+            return round_idx in attack_rounds_untarget
+        if attack_round is not None:
+            return round_idx == attack_round
+        return False
+
     for round_idx in range(1, num_rounds + 1):
         round_start = time.time()
         print(f"\n===== Round {round_idx}: 广播参数 =====")
@@ -191,26 +265,23 @@ def run_federated_simulation(
             do_cipher_map[do.id] = ciphertexts
             clean_update_map[do.id] = do.get_last_updates()
 
-        if (
-            attack_round is not None
-            and attack_do_id is not None
-            and round_idx == attack_round
-            and attack_do_id in clean_update_map
-        ):
-            base_vec = clean_update_map[attack_do_id]
+        for attacker_id in [d.id for d in working_do_list if d is not None and d.id in attack_do_ids]:
+            if attacker_id not in clean_update_map or not _should_poison_round(round_idx, attacker_id):
+                continue
+            base_vec = clean_update_map[attacker_id]
             dim = len(base_vec)
             poisoned: Optional[List[float]] = None
             label = attack_type.lower()
 
             if label == "stealth":
                 poisoned = [(1.0 + attack_lambda) * x for x in base_vec]
-                print(f"[Round {round_idx}] DO {attack_do_id} 执行 Stealth Lie Attack（仅篡改密文），放大系数 1+λ={1.0 + attack_lambda}")
+                print(f"[Round {round_idx}] DO {attacker_id} 执行 Stealth Lie Attack（仅篡改密文），放大系数 1+λ={1.0 + attack_lambda}")
             elif label == "random":
                 poisoned = [_rng.gauss(0.0, attack_sigma) for _ in range(dim)]
-                print(f"[Round {round_idx}] DO {attack_do_id} 执行 Random Attack，σ={attack_sigma}")
+                print(f"[Round {round_idx}] DO {attacker_id} 执行 Random Attack，σ={attack_sigma}")
             elif label == "signflip":
                 poisoned = [-(1.0 + attack_lambda) * x for x in base_vec]
-                print(f"[Round {round_idx}] DO {attack_do_id} 执行 Sign-Flip Attack，系数=-(1+λ)")
+                print(f"[Round {round_idx}] DO {attacker_id} 执行 Sign-Flip Attack，系数=-(1+λ)")
             elif label == "lie_stat":
                 vectors = list(clean_update_map.values())
                 count = len(vectors)
@@ -226,21 +297,22 @@ def run_federated_simulation(
                         sigma_vals[i] += diff * diff
                 sigma_vals = [math.sqrt(s / max(1, count - 1)) for s in sigma_vals]
                 poisoned = [mu[i] + attack_lambda * sigma_vals[i] for i in range(dim)]
-                print(f"[Round {round_idx}] DO {attack_do_id} 执行统计型 Lie Attack，λ={attack_lambda}")
+                print(f"[Round {round_idx}] DO {attacker_id} 执行统计型 Lie Attack，λ={attack_lambda}")
             else:
-                print(f"[Round {round_idx}] DO {attack_do_id} 未知攻击类型 {attack_type}，保持原样")
+                print(f"[Round {round_idx}] DO {attacker_id} 未知攻击类型 {attack_type}，保持原样")
 
             if poisoned is not None:
-                attacker = next((d for d in working_do_list if d is not None and d.id == attack_do_id), None)
+                attacker = next((d for d in working_do_list if d is not None and d.id == attacker_id), None)
                 if attacker is not None:
-                    do_cipher_map[attack_do_id] = [attacker._encrypt_value(v) for v in poisoned]
+                    do_cipher_map[attacker_id] = [attacker._encrypt_value(v) for v in poisoned]
                     if label != "stealth":
-                        clean_update_map[attack_do_id] = list(poisoned)
+                        clean_update_map[attacker_id] = list(poisoned)
                         if attacker.training_history:
                             attacker.training_history[-1]['local_updates'] = list(poisoned)
 
         # 原始向量投毒检测（未映射）
-        run_detection_suite(clean_update_map, "原始向量", temporary=True)
+        det_raw = run_detection_suite(clean_update_map, "原始向量", temporary=True)
+        detection_logs_raw.append({"round": round_idx, "log": det_raw})
 
         # SafeMul 投影
         print(f"\n===== Round {round_idx}: SafeMul 投影计算（在线 DO）=====")
@@ -257,7 +329,8 @@ def run_federated_simulation(
         print(f"[Round {round_idx}] SafeMul 投影耗时 {t2 - t1:.4f}s")
 
         # 投毒检测（映射后）
-        run_detection_suite(csp.do_projection_map, "正交投影向量", temporary=False)
+        det_proj = run_detection_suite(csp.do_projection_map, "正交投影向量", temporary=False)
+        detection_logs_proj.append({"round": round_idx, "log": det_proj})
 
         # 聚合 + 解密 + 更新
         print(f"\n===== Round {round_idx}: CSP 聚合 + 解密更新 =====")
@@ -267,7 +340,7 @@ def run_federated_simulation(
         # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
         if eval_each_round:
             try:
-                train_loss, train_acc, _ = ModelTest.evaluate_params(
+                train_loss, train_acc, _, train_asr, train_src_acc = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -276,8 +349,10 @@ def run_federated_simulation(
                     data_root=os.path.join(os.path.dirname(__file__), "data"),
                     split="train",
                     bn_calib_batches=bn_calib_batches,
+                    source_label=source_label,
+                    target_label=target_label,
                 )
-                val_loss, val_acc, _ = ModelTest.evaluate_params(
+                val_loss, val_acc, _, val_asr, val_src_acc = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -286,8 +361,16 @@ def run_federated_simulation(
                     data_root=os.path.join(os.path.dirname(__file__), "data"),
                     split="val",
                     bn_calib_batches=bn_calib_batches,
+                    source_label=source_label,
+                    target_label=target_label,
                 )
-                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%")
+                extra_train = ""
+                extra_val = ""
+                if train_asr is not None and train_src_acc is not None:
+                    extra_train = f", ASR(s->{target_label})={train_asr*100:.2f}%, src_acc={train_src_acc*100:.2f}%"
+                if val_asr is not None and val_src_acc is not None:
+                    extra_val = f", ASR(s->{target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
+                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}%{extra_train} | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%{extra_val}")
             except Exception as e:
                 print(f"[Eval][Round {round_idx}] 评估失败: {e}")
 
@@ -313,7 +396,7 @@ def run_federated_simulation(
         # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
         if eval_each_round:
             try:
-                train_loss, train_acc, _ = ModelTest.evaluate_params(
+                train_loss, train_acc, _, train_asr, train_src_acc = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -322,8 +405,10 @@ def run_federated_simulation(
                     data_root=os.path.join(os.path.dirname(__file__), "data"),
                     split="train",
                     bn_calib_batches=bn_calib_batches,
+                    source_label=source_label,
+                    target_label=target_label,
                 )
-                val_loss, val_acc, _ = ModelTest.evaluate_params(
+                val_loss, val_acc, _, val_asr, val_src_acc = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -332,6 +417,8 @@ def run_federated_simulation(
                     data_root=os.path.join(os.path.dirname(__file__), "data"),
                     split="val",
                     bn_calib_batches=bn_calib_batches,
+                    source_label=source_label,
+                    target_label=target_label,
                 )
                 eval_history.append({
                     "round": round_idx,
@@ -339,8 +426,18 @@ def run_federated_simulation(
                     "train_acc": train_acc,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
+                    "train_asr": train_asr,
+                    "train_src_acc": train_src_acc,
+                    "val_asr": val_asr,
+                    "val_src_acc": val_src_acc,
                 })
-                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}% | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%")
+                extra_train = ""
+                extra_val = ""
+                if train_asr is not None and train_src_acc is not None:
+                    extra_train = f", ASR(s->{target_label})={train_asr*100:.2f}%, src_acc={train_src_acc*100:.2f}%"
+                if val_asr is not None and val_src_acc is not None:
+                    extra_val = f", ASR(s->{target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
+                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}%{extra_train} | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%{extra_val}")
                 metric = val_acc if not math.isnan(val_acc) else train_acc
                 if metric > best_metric:
                     best_metric = metric
@@ -350,7 +447,6 @@ def run_federated_simulation(
         round_elapsed = time.time() - round_start
         round_times.append(round_elapsed)
         print(f"[Round {round_idx}] 用时 {round_elapsed:.2f}s")
-
     total_elapsed = time.time() - total_start
     print("\n===== 全部轮次结束 =====")
     print(f"最终全局参数前5: {csp.global_params[:5]}")
@@ -361,7 +457,7 @@ def run_federated_simulation(
     # 可选：最终明文推理评估（与 Train 同步：支持 BN 校准）
     if eval_each_round:
         try:
-            val_loss, val_acc, _ = ModelTest.evaluate_params(
+            val_loss, val_acc, _, val_asr, val_src_acc = ModelTest.evaluate_params(
                 csp.global_params,
                 model_name=model_name,
                 dataset_name=dataset_name,
@@ -370,14 +466,21 @@ def run_federated_simulation(
                 data_root=os.path.join(os.path.dirname(__file__), "data"),
                 split="val",
                 bn_calib_batches=bn_calib_batches,
+                source_label=source_label,
+                target_label=target_label,
             )
-            print(f"[Final Eval] Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%")
+            extra_val = ""
+            if val_asr is not None and val_src_acc is not None:
+                extra_val = f", ASR(s->{target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
+            print(f"[Final Eval] Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%{extra_val}")
         except Exception as e:
             print(f"[Final Eval] 评估失败: {e}")
     # 保存最终全局参数
     try:
-        os.makedirs("trainResult", exist_ok=True)
-        result_path = os.path.join("trainResult", f"{run_tag}_params.json")
+        # 为本次运行单独创建目录：trainResult/<run_tag>/
+        base_dir = os.path.join("trainResult", run_tag)
+        os.makedirs(base_dir, exist_ok=True)
+        result_path = os.path.join(base_dir, "params.json")
         with open(result_path, "w", encoding="utf-8") as f:
             json.dump({
                 "rounds": num_rounds,
@@ -389,7 +492,7 @@ def run_federated_simulation(
         print(f"全局参数已保存至: {result_path}")
         # 保存最优参数（如评估开启）
         if best_params is not None:
-            best_path = os.path.join("trainResult", f"{run_tag}_best_params.json")
+            best_path = os.path.join(base_dir, "best_params.json")
             with open(best_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "rounds": num_rounds,
@@ -413,17 +516,35 @@ def run_federated_simulation(
             )
     # 记录日志到 txt（时间、评估、收敛）
     try:
-        log_path = os.path.join("trainResult", f"{run_tag}_log.txt")
+        base_dir = os.path.join("trainResult", run_tag)
+        os.makedirs(base_dir, exist_ok=True)
+        log_path = os.path.join(base_dir, "log.txt")
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"总用时: {total_elapsed:.2f}s\n")
             f.write("按轮用时(s): " + ", ".join(f"{t:.2f}" for t in round_times) + "\n\n")
             if eval_history:
                 f.write("评估指标（train/val）:\n")
                 for ev in eval_history:
+                    extra_train = ""
+                    extra_val = ""
+                    if ev.get("train_asr") is not None and ev.get("train_src_acc") is not None:
+                        extra_train = f", ASR={ev['train_asr']*100:.2f}%, src_acc={ev['train_src_acc']*100:.2f}%"
+                    if ev.get("val_asr") is not None and ev.get("val_src_acc") is not None:
+                        extra_val = f", ASR={ev['val_asr']*100:.2f}%, src_acc={ev['val_src_acc']*100:.2f}%"
                     f.write(
-                        f"Round {ev['round']}: Train loss={ev['train_loss']:.4f}, acc={ev['train_acc']*100:.2f}%; "
-                        f"Val loss={ev['val_loss']:.4f}, acc={ev['val_acc']*100:.2f}%\n"
+                        f"Round {ev['round']}: Train loss={ev['train_loss']:.4f}, acc={ev['train_acc']*100:.2f}%{extra_train}; "
+                        f"Val loss={ev['val_loss']:.4f}, acc={ev['val_acc']*100:.2f}%{extra_val}\n"
                     )
+                f.write("\n")
+            if detection_logs_raw:
+                f.write("投毒检测日志（原始向量）:\n")
+                for item in detection_logs_raw:
+                    f.write(f"[Round {item['round']}]\n{item['log']}\n")
+                f.write("\n")
+            if detection_logs_proj:
+                f.write("投毒检测日志（正交投影向量）:\n")
+                for item in detection_logs_proj:
+                    f.write(f"[Round {item['round']}]\n{item['log']}\n")
                 f.write("\n")
             if round_stats:
                 f.write("收敛指标（ΔL2, ΔL∞）:\n")
@@ -443,18 +564,67 @@ if __name__ == "__main__":
     parser.add_argument("--initial-params-path", type=str, default=None,help="可选初始全局参数文件路径")
     parser.add_argument("--bn-calib-batches", type=int, default=30, help="评估时 BN 校准用的训练批次数（仅 ResNet 有效）")
     # 以下保持原默认示例参数，可按需扩展更多 CLI
-    parser.add_argument("--num-rounds", type=int, default=20)
-    parser.add_argument("--num-do", type=int, default=10)
-    parser.add_argument("--model-size", type=int, default=56714)  # cnn:56714 / lenet:81086 / resnet20:272186
-    parser.add_argument("--model-name", type=str, default="cnn")#cnn /lenet /resnet20
-    parser.add_argument("--dataset-name", type=str, default="mnist")#mnist /cifar10
-    parser.add_argument("--train-batch-size", type=int, default=64)
-    parser.add_argument("--train-max-batches", type=int, default=300)
+    # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
+    parser.add_argument("--num-rounds", type=int, default=30)#联邦轮次
+    parser.add_argument("--num-do", type=int, default=10)#在线DO数
+    parser.add_argument("--model-size", type=int, default=61706)  # cnn:61706 / lenet:81086 / resnet20:272186
+    parser.add_argument("--model-name", type=str, default="cnn")    #模型名称：cnn /lenet /resnet20
+    parser.add_argument("--dataset-name", type=str, default="mnist")#数据集名称：mnist /cifar10
+    # DO 训练相关，batch size / max batches
+    parser.add_argument("--train-batch-size", type=int, default=64)#训练batch size
+    parser.add_argument("--train-max-batches", type=int, default=300)#训练最大batch数
+    parser.add_argument(
+        "--partition-mode",
+        type=str,
+        default="iid",
+        help="数据划分模式：iid / mild / extreme（控制各 DO 的本地数据是否 non-IID）",
+    )
+    # 评估相关
     parser.add_argument("--eval-each-round", dest="eval_each_round", action="store_true", default=True, help="开启每轮明文评估（会额外耗时，默认开启）")
-    parser.add_argument("--no-eval-each-round", dest="eval_each_round", action="store_false", help="关闭每轮明文评估")
+    #parser.add_argument("--no-eval-each-round", dest="eval_each_round", action="store_false", help="关闭每轮明文评估")暂时没用
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--eval-batches", type=int, default=50)
+    #target攻击： label flip 相关参数 source_label:源标签 / target_label:目标标签 / attack_do_id:攻击 DO id / attack_rounds:攻击轮次 / poison_ratio:翻转比例：该 batch 的源类样本中随机抽 30% 改标签，其余不动
+    parser.add_argument("--attack-do-id",type=str,default="0,1",help="攻击 DO id（同时用于 label flip 和 untarget 投毒）如0,1；留空则不攻击（无需引号）",)
+    parser.add_argument("--source-label", type=int, default=1, help="若需监测 label flip，指定源标签，如2，代表把数据集中的2类数据投毒成3类数据")
+    parser.add_argument("--target-label", type=int, default=9, help="若需监测 label flip，指定目标标签，如3，代表把数据集中的2类数据投毒成3类数据") 
+    parser.add_argument("--attack-rounds", type=str, default="all", help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发")
+    parser.add_argument("--poison-ratio", type=float, default=0.6, help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）")
+    # untarget 梯度/参数投毒配置（与 label flip 解耦；留空则完全不启用 untarget）
+    parser.add_argument("--attack-type",type=str,default=None,help="untarget 梯度/参数投毒类型：stealth/random/signflip/lie_stat；留空则不启用",)
+    parser.add_argument("--attack-round-untarget",type=str,default=None,help="untarget 梯度/参数投毒触发轮次：单个数字、逗号列表或 all；留空则不触发",)
+    parser.add_argument("--attack-lambda", type=float, default=0.2, help="untarget 投毒放大系数（stealth/signflip/lie_stat 使用）")
+    parser.add_argument("--attack-sigma", type=float, default=1.0, help="untarget random 投毒的标准差")
     args = parser.parse_args()
+
+    attack_rounds = None
+    if args.attack_rounds:
+        if args.attack_rounds.lower() == "all":
+            attack_rounds = "all"
+        else:
+            attack_rounds = [int(x) for x in args.attack_rounds.split(",") if x.strip()]
+
+    attack_do_ids: List[int] = []
+    if args.attack_do_id:
+        attack_do_ids = [int(x) for x in args.attack_do_id.split(",") if x.strip()]
+
+    attack_round_parsed: Optional[int] = None
+    attack_rounds_untarget: Optional[object] = None
+    if args.attack_round_untarget:
+        if args.attack_round_untarget.lower() == "all":
+            print("untarget 梯度/参数投毒将在所有轮次触发")
+            attack_rounds_untarget = "all"
+        elif "," in args.attack_round_untarget:
+            # 支持形如 "3,4,5" 的多轮触发
+            attack_rounds_untarget = [
+                int(x) for x in args.attack_round_untarget.split(",") if x.strip()
+            ]
+        else:
+            # 单个数字：只在该轮触发
+            try:
+                attack_round_parsed = int(args.attack_round_untarget)
+            except ValueError:
+                attack_round_parsed = None
 
     run_federated_simulation(
         num_rounds=args.num_rounds,
@@ -472,4 +642,15 @@ if __name__ == "__main__":
         eval_each_round=args.eval_each_round,
         eval_batch_size=args.eval_batch_size,
         eval_batches=args.eval_batches,
+        source_label=args.source_label,
+        target_label=args.target_label,
+        attack_do_ids=attack_do_ids,
+        attack_rounds=attack_rounds,
+        poison_ratio=args.poison_ratio,
+        partition_mode=args.partition_mode,
+        attack_type=args.attack_type,
+        attack_round=attack_round_parsed,
+        attack_rounds_untarget=attack_rounds_untarget,
+        attack_lambda=args.attack_lambda,
+        attack_sigma=args.attack_sigma,
     )

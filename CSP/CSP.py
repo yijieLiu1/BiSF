@@ -6,6 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import hashlib
 import math
+import random
 from typing import List, Dict, Optional
 from utils.ImprovedPaillier import ImprovedPaillier
 from utils.Threshold import recover_secret
@@ -386,6 +387,7 @@ class CSP:
         """
         基于当前 do_projection_map（每个 DO 的 w·U 投影向量）执行 Multi-Krum 异常检测。
         Args:
+            k：对每个候选向量，只取它最近的 K 个邻居来计算分数
             f: 可容忍的恶意客户端个数估计（影响 K = N - f - 2）
             alpha: IQR 放大系数，用于判定“远离大多数”的阈值
         Returns:
@@ -402,7 +404,7 @@ class CSP:
             print("[CSP] 投毒检测跳过：在线 DO 少于 2 个。")
             return []
 
-        # 计算 pairwise 距离矩阵（对称，平方欧氏距离）
+        # 计算 pairwise 距离矩阵（对称，平方欧氏距离），计算n*n的矩阵
         dist = [[0.0] * n for _ in range(n)]
         for i in range(n):
             vi = vectors[i]
@@ -419,14 +421,14 @@ class CSP:
             print(f"[CSP] 投毒检测跳过：K={K} 无意义（n={n}, f={f}）。")
             return []
 
-        # 计算 Krum score
+        # 计算 Krum score，找到除自己外的其余参数，取最小的k个距离求和
         scores: List[float] = []
         for i in range(n):
             row = [dist[i][j] for j in range(n) if j != i]
             row.sort()
             scores.append(sum(row[:K]))
 
-        # 中位数和 IQR
+        # 中位数和 IQR：这里用“上半部分的中位数 - 下半部分的中位数”，最终算出一个阈值
         def _median(vals: List[float]) -> float:
             vals_sorted = sorted(vals)
             m = len(vals_sorted)
@@ -463,6 +465,7 @@ class CSP:
     def detect_poison_geomedian(self, beta: float = 1.5, max_iter: int = 50, eps: float = 1e-9) -> List[int]:
         """
         基于几何中位数的异常检测：计算鲁棒中心后，按中位数+IQR 标记远离中心的 DO。
+        基于所有的参数，计算得到全局的几何的中位数【离所有的点最近】，然后基于这个全局的中位数，进行距离比较
         Args:
             beta: IQR 放大系数
             max_iter: Weiszfeld 迭代次数上限
@@ -553,8 +556,13 @@ class CSP:
     def detect_poison_clustering(self, k: int = 2, max_iter: int = 10, alpha: float = 1.5) -> List[int]:
         """
         简易聚类式防御（余弦相似度版）：使用 spherical k-means（cosine distance）将投影向量聚类，丢弃离群簇。
-    - assignment: 最小化 cosine distance = 1 - cos
-    - center update: 簇内单位向量求和后再归一化（方向中心）
+        - assignment: 最小化 cosine distance = 1 - cos
+        - center update: 簇内单位向量求和后再归一化（方向中心）
+
+        修改点（不改变输入输出）：
+        1) 初始化中心：由“取前 k 个样本” -> 余弦距离版 k-means++（更稳定）
+        2) 可选少量重启（restarts），选择簇内总余弦距离最小的结果（仍保持输出结构一致）
+        3) 复用 counts 计算 size，减少重复遍历
         """
         if not self.do_projection_map or k < 1:
             print("[CSP] Cluster 检测跳过：无投影数据或 k 无效。")
@@ -563,13 +571,13 @@ class CSP:
         ids = sorted(self.do_projection_map.keys())
         raw_vectors = [self.do_projection_map[i] for i in ids]
         n = len(raw_vectors)
-        if n <= 1:  
+        if n <= 1:
             return []
         dim = len(raw_vectors[0])
         k = min(k, n)
 
         def _norm(v: List[float]) -> float:
-            return math.sqrt(sum(x * x for x in v)) 
+            return math.sqrt(sum(x * x for x in v))
 
         def _normalize(v: List[float]) -> List[float]:
             nv = _norm(v)
@@ -582,59 +590,163 @@ class CSP:
             return sum(x * y for x, y in zip(a, b))
 
         def cosine_dist_unit(a_unit: List[float], b_unit: List[float]) -> float:
-        # a_unit, b_unit 都应已归一化；cos ∈ [-1,1]
+            # a_unit, b_unit 都应已归一化；cos ∈ [-1, 1]
             return 1.0 - _dot(a_unit, b_unit)
 
-    # 1) 预归一化所有向量（球面 k-means 的基本步骤）
+        # 1) 预归一化所有向量（球面 k-means 的基本步骤）
         vectors = [_normalize(v) for v in raw_vectors]
 
-    # 2) 初始化中心：直接取前 k 个单位向量
-        centers = [vectors[i][:] for i in range(k)]
-        assignments = [-1] * n
+        # 若全是零向量（归一化后仍全 0），余弦距离失效，直接退出（保持安全）
+        if all(_norm(v) == 0.0 for v in vectors):
+            print("[CSP] Cluster 检测跳过：所有向量为零，余弦聚类无意义。")
+            return []
 
-        for _ in range(max_iter):
-            changed = False
+        # -------------------------
+        # 2) 余弦版 k-means++ 初始化
+        # -------------------------
+        def _kmeanspp_init(rng: random.Random) -> List[List[float]]:
+            # 选第一个中心：从非零向量里随机选
+            nonzero_indices = [i for i, v in enumerate(vectors) if _norm(v) > 0.0]
+            if not nonzero_indices:
+                # 理论上已被上面的 all-zero 拦住，这里兜底
+                return [vectors[0][:] for _ in range(k)]
 
-        # 2.1 assignment：按最小 cosine distance 分配
+            first = rng.choice(nonzero_indices)
+            centers = [vectors[first][:]]
+
+            # 维护每个点到“最近中心”的距离（余弦距离）
+            closest = [cosine_dist_unit(vectors[i], centers[0]) for i in range(n)]
+
+            while len(centers) < k:
+                # 概率 ∝ dist^2（经典 k-means++；这里 dist 是余弦距离）
+                weights = []
+                total = 0.0
+                for i in range(n):
+                    d = closest[i]
+                    w = d * d
+                    weights.append(w)
+                    total += w
+
+                if total <= 0.0:
+                    # 所有点到最近中心距离都为 0：说明基本同向，剩余中心随便补齐
+                    for i in range(n):
+                        if len(centers) >= k:
+                            break
+                        centers.append(vectors[i][:])
+                    break
+
+                # 轮盘赌采样
+                r = rng.random() * total
+                acc = 0.0
+                chosen = 0
+                for i, w in enumerate(weights):
+                    acc += w
+                    if acc >= r:
+                        chosen = i
+                        break
+
+                centers.append(vectors[chosen][:])
+
+                # 更新 closest
+                new_c = centers[-1]
+                for i in range(n):
+                    d = cosine_dist_unit(vectors[i], new_c)
+                    if d < closest[i]:
+                        closest[i] = d
+
+            return centers
+
+        # -------------------------
+        # 3) spherical k-means 主循环（单次运行）
+        # -------------------------
+        def _run_spherical_kmeans(init_centers: List[List[float]]):
+            centers = [c[:] for c in init_centers]
+            assignments = [-1] * n
+
+            for _ in range(max_iter):
+                changed = False
+
+                # assignment
+                for idx, vec in enumerate(vectors):
+                    # 跳过零向量：它与任何中心的 dot 都是 0，cos dist = 1，分配结果不稳定
+                    # 这里采取“照常参与”，但不会让其主导中心（update 时会被加进去）
+                    dists = [cosine_dist_unit(vec, c) for c in centers]
+                    new_k = min(range(k), key=lambda i: dists[i])
+                    if assignments[idx] != new_k:
+                        assignments[idx] = new_k
+                        changed = True
+
+                if not changed:
+                    break
+
+                # update
+                counts = [0] * k
+                sums = [[0.0] * dim for _ in range(k)]
+                for assign, vec in zip(assignments, vectors):
+                    if assign < 0:
+                        continue
+                    counts[assign] += 1
+                    for j in range(dim):
+                        sums[assign][j] += vec[j]
+
+                for i in range(k):
+                    if counts[i] == 0:
+                        # fallback：随机挑一个点当中心（比 vectors[i % n] 更不依赖顺序）
+                        # 这里不额外引入 rng，保持单次运行内简单；外层重启会提供多样性
+                        centers[i] = vectors[i % n][:]
+                    else:
+                        centers[i] = _normalize(sums[i])
+
+            # 计算簇内总损失（用于重启择优）：sum_i min_c cosine_dist(x_i, c)
+            inertia = 0.0
             for idx, vec in enumerate(vectors):
-                dists = [cosine_dist_unit(vec, c) for c in centers]
-                new_k = min(range(k), key=lambda i: dists[i])
-                if assignments[idx] != new_k:
-                    assignments[idx] = new_k
-                    changed = True
+                c = centers[assignments[idx]]
+                inertia += cosine_dist_unit(vec, c)
 
-            if not changed:
-                break
+            return centers, assignments, inertia
+        # -------------------------
+        # 4) 少量重启：择优（不改变对外接口）
+        # -------------------------
+        # 重启次数取一个小值，避免额外开销；n 小时也不会明显变慢
+        restarts = 3 if n >= 6 else 1
 
-        # 2.2 update：簇内向量求和，再归一化（方向中心）
-            counts = [0] * k
-            sums = [[0.0] * dim for _ in range(k)]
-            for assign, vec in zip(assignments, vectors):
-                if assign < 0:
-                    continue
-                counts[assign] += 1
-                for j in range(dim):
-                    sums[assign][j] += vec[j]
+        # 用 ids 生成确定性 seed，尽量保证“同一批输入 -> 同一输出”（便于复现实验）
+        seed = 146527 + (sum(ids) % 1000003)
+        rng = random.Random(seed)
 
-            for i in range(k):
-                if counts[i] == 0:
-                # fallback：选一个样本作为中心
-                    centers[i] = vectors[i % n][:]
-                else:
-                    centers[i] = _normalize(sums[i])
+        best_centers = None
+        best_assignments = None
+        best_inertia = float("inf")
 
-    # 3) 全局中心：所有单位向量求和后归一化（方向整体中心）
+        for _ in range(restarts):
+            init_centers = _kmeanspp_init(rng)
+            centers, assignments, inertia = _run_spherical_kmeans(init_centers)
+            if inertia < best_inertia:
+                best_inertia = inertia
+                best_centers = centers
+                best_assignments = assignments
+
+        centers = best_centers
+        assignments = best_assignments
+
+        # 3) 全局中心：所有单位向量求和后归一化（方向整体中心）
         overall_sum = [0.0] * dim
         for vec in vectors:
             for j, val in enumerate(vec):
                 overall_sum[j] += val
         overall = _normalize(overall_sum)
 
-    # 4) 簇得分：与整体中心的“角距离” × (n/size)
-    #    角距离这里用 cosine distance（越大越离群）
+        # 4) 簇得分：与整体中心的“角距离” × (n/size)
+        #    角距离这里用 cosine distance（越大越离群）
+        #    同时复用 counts，避免 size 重复遍历
+        counts = [0] * k
+        for a in assignments:
+            if 0 <= a < k:
+                counts[a] += 1
+
         scores = []
         for i in range(k):
-            size = sum(1 for a in assignments if a == i)
+            size = counts[i]
             if size == 0:
                 scores.append(float("inf"))
                 continue
@@ -674,102 +786,7 @@ class CSP:
         else:
             print("[CSP] Cluster(Cosine) 未发现可疑 DO（根据当前阈值）。")
         return suspects
-    # def detect_poison_clustering(self, k: int = 2, max_iter: int = 10, alpha: float = 1.5) -> List[int]:
-    #     """
-    #     简易聚类式防御：用 k-means 将投影向量聚类，丢弃离群簇。
-    #     """
-    #     if not self.do_projection_map or k < 1:
-    #         print("[CSP] Cluster 检测跳过：无投影数据或 k 无效。")
-    #         return []
-
-    #     ids = sorted(self.do_projection_map.keys())
-    #     vectors = [self.do_projection_map[i] for i in ids]
-    #     n = len(vectors)
-    #     if n <= 1:
-    #         return []
-    #     dim = len(vectors[0])
-    #     k = min(k, n)
-
-    #     # 初始化中心
-    #     centers = [vectors[i][:] for i in range(k)]
-    #     assignments = [0] * n
-
-    #     def dist_sq(a, b):
-    #         return sum((x - y) ** 2 for x, y in zip(a, b))
-
-    #     for _ in range(max_iter):
-    #         changed = False
-    #         for idx, vec in enumerate(vectors):
-    #             dists = [dist_sq(vec, c) for c in centers]
-    #             new_k = min(range(k), key=lambda i: dists[i])
-    #             if assignments[idx] != new_k:
-    #                 assignments[idx] = new_k
-    #                 changed = True
-    #         if not changed:
-    #             break
-    #         # 更新中心
-    #         counts = [0] * k
-    #         sums = [[0.0] * dim for _ in range(k)]
-    #         for assign, vec in zip(assignments, vectors):
-    #             counts[assign] += 1
-    #             for j in range(dim):
-    #                 sums[assign][j] += vec[j]
-    #         for i in range(k):
-    #             if counts[i] == 0:
-    #                 centers[i] = vectors[_ % n][:]  # fallback
-    #             else:
-    #                 centers[i] = [s / counts[i] for s in sums[i]]
-
-    #     # 全局中心
-    #     overall = [0.0] * dim
-    #     for vec in vectors:
-    #         for j, val in enumerate(vec):
-    #             overall[j] += val
-    #     overall = [v / n for v in overall]
-
-    #     # 计算簇得分：距离 * (n/size)
-    #     scores = []
-    #     for i in range(k):
-    #         size = sum(1 for a in assignments if a == i)
-    #         if size == 0:
-    #             scores.append(float('inf'))
-    #             continue
-    #         d = math.sqrt(dist_sq(centers[i], overall))
-    #         score = d * (n / size)
-    #         scores.append(score)
-
-    #     def _median(vals: List[float]) -> float:
-    #         vals_sorted = sorted(vals)
-    #         m = len(vals_sorted)
-    #         mid = m // 2
-    #         if m % 2:
-    #             return vals_sorted[mid]
-    #         return 0.5 * (vals_sorted[mid - 1] + vals_sorted[mid])
-
-    #     def _iqr(vals: List[float]) -> float:
-    #         if len(vals) < 4:
-    #             return 0.0
-    #         vals_sorted = sorted(vals)
-    #         m = len(vals_sorted)
-    #         mid = m // 2
-    #         lower = vals_sorted[:mid]
-    #         upper = vals_sorted[mid + (0 if m % 2 == 0 else 1):]
-    #         if not lower or not upper:
-    #             return 0.0
-    #         return _median(upper) - _median(lower)
-
-    #     med = _median(scores)
-    #     iqr = _iqr(scores)
-    #     threshold = med + alpha * iqr
-    #     suspect_clusters = [i for i, sc in enumerate(scores) if sc > threshold]
-    #     suspects = [ids[idx] for idx, c in enumerate(assignments) if c in suspect_clusters]
-    #     print(f"[CSP] Cluster 检测：scores={scores}, 阈值={threshold:.6f}")
-    #     if suspects:
-    #         print(f"[CSP] Cluster 可疑 DO: {suspects}")
-    #     else:
-    #         print("[CSP] Cluster 未发现可疑 DO（根据当前阈值）。")
-    #     return suspects
-
+        
     def detect_poison_lasa_lite(self, angle_threshold: float = 0.0, beta: float = 1.5) -> List[int]:
         """
         LASA-lite风格检测：方向和模长双重检查。
