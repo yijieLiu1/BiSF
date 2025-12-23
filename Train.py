@@ -21,6 +21,7 @@ from TA.TA import TA
 from DO.DO import DO  # 复用模型与数据集工厂
 from CSP.CSP import CSP  # 复用投毒检测逻辑（Multi-Krum / GeoMedian / Cluster / LASA-lite）
 import ModelTest  # 复用评估逻辑
+from utils.detection_metrics import DetectionMetricsTracker
 
 
 def infer_model_size(model_name: str, dataset_name: str) -> int:
@@ -86,26 +87,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DO 明文训练（支持投毒），输出全局参数")
     parser.add_argument("--rounds", type=int, default=50, help="训练轮数")
     parser.add_argument("--num-do", type=int, default=10, help="DO 数量")
-    parser.add_argument("--model-name", type=str, default="cnn", help="模型名称（cnn/lenet/resnet20，对应 LeNet-5 或 ResNet20）")
-    parser.add_argument("--dataset-name", type=str, default="mnist", help="数据集名称（mnist/cifar10）")
+    parser.add_argument("--model-name", type=str, default="resnet20", help="模型名称（cnn/lenet/resnet20，对应 LeNet-5 或 ResNet20）")
+    parser.add_argument("--dataset-name", type=str, default="cifar10", help="数据集名称（mnist/cifar10）")
     parser.add_argument("--batch-size", type=int, default=64, help="训练批大小")
     parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
     parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 训练数据的 IID/non-IID 程度）",)
     # target label flip 投毒设置（与 Test.py 对齐）
-    parser.add_argument("--poison-do-id",type=str,default="0,1,2",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
-    parser.add_argument("--source-label", type=int, default=None, help="若需 label flip，指定源标签")
-    parser.add_argument("--target-label", type=int, default=None, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
+    parser.add_argument("--poison-do-id",type=str,default="0,1",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
+    parser.add_argument("--source-label", type=int, default=1, help="若需 label flip，指定源标签")
+    parser.add_argument("--target-label", type=int, default=99, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
     parser.add_argument("--attack-rounds",type=str,default="all",help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发",)
     parser.add_argument("--poison-ratio",type=float,default=1.0,help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）",)
-    # untarget 梯度/参数投毒设置（stealth/random/signflip/lie_stat）
+    # 梯度投毒设置（stealth/random/signflip/lie_stat）
     parser.add_argument("--attack-type", type=str, default=None, help="untarget 投毒类型（stealth/random/signflip/lie_stat）")
     parser.add_argument("--attack-round-untarget", type=str,default=None,help="untarget 投毒触发轮次：单个数字、逗号列表或 all；留空则不触发",)
     parser.add_argument("--attack-lambda", type=float, default=0.25, help="投毒放大系数")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="随机投毒的标准差")
     # backdoor (BadNets-style) 配置
-    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=True,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
+    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=False,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
     parser.add_argument("--bd-target-label", type=int, default=9, help="backdoor 目标标签")
-    parser.add_argument("--bd-ratio", type=float, default=0.4, help="backdoor 在源标签样本中的注入比例")
+    parser.add_argument("--bd-ratio", type=float, default=0.3, help="backdoor 在源标签样本中的注入比例")
     parser.add_argument("--bd-trigger-size", type=int, default=3, help="触发器方块尺寸（像素）")
     parser.add_argument("--bd-trigger-value", type=float, default=3.0, help="触发器像素值（归一化前）")
     #结果保存（Plain 明文训练结果，文件名中带 plain 以便区分加密版本）
@@ -148,7 +149,7 @@ def main() -> None:
     model_size = infer_model_size(args.model_name, args.dataset_name)
     print(f"[Train] 模型参数量估计: {model_size}")
     # 构建 TA：用于 DO 初始化与正交向量生成（与 Test.py 保持一致，使用 2048 维投影）
-    ta = TA(num_do=args.num_do, model_size=model_size, orthogonal_vector_count=2_048, bit_length=512)
+    ta = TA(num_do=args.num_do, model_size=model_size, orthogonal_vector_count=1024, bit_length=512)
 
     # 仅用于投毒检测的 CSP：复用 Multi-Krum / GeoMedian / Cluster / LASA-lite 逻辑
     csp_detector = CSP(ta, model_size=model_size, precision=10 ** 6, initial_params_path=None)
@@ -204,8 +205,12 @@ def main() -> None:
     detection_logs_proj: List[Dict[str, str]] = []
     best_params = None
     best_val_acc = -1.0
+    detection_methods = ("multi_krum", "geomedian", "clustering")
+    raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
+    proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
 
-    def _run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> str:
+
+    def _run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> Dict[str, object]:
         """
         在明文训练下执行一次投毒检测：
         - vector_map: {do_id: 向量}，通常为原始模型参数或已经计算好的投影向量
@@ -213,20 +218,23 @@ def main() -> None:
         使用 CSP 的投毒检测接口，但不涉及 SafeMul 或一致性检验。
         """
         if not vector_map:
-            return ""
+            return {"log": "", "suspects": {}}
         backup = None
         if temporary:
             backup = csp_detector.do_projection_map
             csp_detector.do_projection_map = {k: list(v) for k, v in vector_map.items()}
         buf = io.StringIO()
+        suspects_multi: List[int] = []
+        suspects_geo: List[int] = []
+        suspects_cluster: List[int] = []
         with contextlib.redirect_stdout(buf):
             print(f"\n----- 投毒检测（{label}，Plain）-----")
             active_count = len(csp_detector.do_projection_map)
             if active_count >= 2:
                 # 这里参数与 Test.py 中保持一致，后续可按需调整敏感度
-                csp_detector.detect_poison_multi_krum(f=4, alpha=1.5)
-                csp_detector.detect_poison_geomedian(beta=1.5)
-                csp_detector.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
+                suspects_multi = csp_detector.detect_poison_multi_krum(f=4, alpha=1.5)
+                suspects_geo = csp_detector.detect_poison_geomedian(beta=1.5)
+                suspects_cluster = csp_detector.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
                 # csp_detector.detect_poison_lasa_lite(angle_threshold=0.0, beta=1.5)
             else:
                 print("[检测] 在线 DO 数不足，跳过。")
@@ -234,7 +242,14 @@ def main() -> None:
         print(output, end="")
         if temporary:
             csp_detector.do_projection_map = backup
-        return output
+        return {
+            "log": output,
+            "suspects": {
+                "multi_krum": suspects_multi,
+                "geomedian": suspects_geo,
+                "clustering": suspects_cluster,
+            },
+        }
 
     def _should_poison_round(round_idx: int, do_id: int) -> bool:
         """untarget 梯度/参数投毒的触发判定：支持 all / 列表 / 单次"""
@@ -247,6 +262,39 @@ def main() -> None:
         if attack_round_parsed is not None:
             return round_idx == attack_round_parsed
         return False
+
+    def _should_label_flip_round(round_idx: int, do_id: int) -> bool:
+        if args.source_label is None or args.target_label is None:
+            return False
+        if do_id not in poison_do_ids:
+            return False
+        if attack_rounds == "all":
+            return True
+        if isinstance(attack_rounds, list):
+            return round_idx in attack_rounds
+        return False
+
+    def _should_backdoor_round(do_id: int) -> bool:
+        if not args.bd_enable:
+            return False
+        if do_id not in poison_do_ids:
+            return False
+        if args.bd_target_label is None:
+            return False
+        if args.bd_ratio is None or float(args.bd_ratio) <= 0.0:
+            return False
+        return True
+
+    def _get_poisoned_ids(round_idx: int, active_ids: List[int]) -> set:
+        poisoned = set()
+        for do_id in active_ids:
+            if _should_poison_round(round_idx, do_id):
+                poisoned.add(do_id)
+            if _should_label_flip_round(round_idx, do_id):
+                poisoned.add(do_id)
+            if _should_backdoor_round(do_id):
+                poisoned.add(do_id)
+        return poisoned
 
     total_start = time.time()
     for r in range(1, args.rounds + 1):
@@ -269,9 +317,17 @@ def main() -> None:
             else:
                 updates[do.id] = local
 
-        # 投毒检测（原始向量，Plain）
-        det_raw = _run_detection_suite(updates, "原始向量")
-        detection_logs_raw.append({"round": r, "log": det_raw})
+        active_ids = list(updates.keys())
+        poisoned_ids = _get_poisoned_ids(r, active_ids)
+
+        # Poison detection (raw vectors, Plain)
+        det_raw = _run_detection_suite(updates, "raw_vectors")
+        detection_logs_raw.append({"round": r, "log": det_raw["log"]})
+        raw_suspects = det_raw.get("suspects", {})
+        for method in detection_methods:
+            raw_metrics.update(
+                method, r, raw_suspects.get(method), poisoned_ids, active_ids
+            )
 
         # 使用 TA 生成的完整正交向量组 U（形状约为 2048×model_size），直接做明文点积 w·U 得到 2048 维投影
         print(f"\n===== Round {r}: 正交投影计算（Plain，在线 DO）=====")
@@ -291,8 +347,14 @@ def main() -> None:
                 print(f" DO {do_id} 投影向量(长度{len(proj)})")
             # 更新 detector 的投影映射并执行检测
             csp_detector.do_projection_map = proj_map
-            det_proj = _run_detection_suite(proj_map, "正交投影向量", temporary=False)
-            detection_logs_proj.append({"round": r, "log": det_proj})
+            det_proj = _run_detection_suite(proj_map, "orthogonal_projection", temporary=False)
+            detection_logs_proj.append({"round": r, "log": det_proj["log"]})
+            proj_active_ids = list(proj_map.keys())
+            proj_suspects = det_proj.get("suspects", {})
+            for method in detection_methods:
+                proj_metrics.update(
+                    method, r, proj_suspects.get(method), poisoned_ids, proj_active_ids
+                )
         t2 = time.time()
         print(f"[Train][Round {r}] 正交投影耗时 {t2 - t1:.4f}s")
 
@@ -482,6 +544,11 @@ def main() -> None:
             for item in detection_logs_proj:
                 f.write(f"[Round {item['round']}]\n{item['log']}\n")
             f.write("\n")
+        for line in raw_metrics.format_summary("raw_vectors"):
+            f.write(line + "\n")
+        for line in proj_metrics.format_summary("orthogonal_projection"):
+            f.write(line + "\n")
+        f.write("\n")
     print(f"[Train] 日志已保存: {log_path}")
     print(f"[Train] 总用时: {total_elapsed:.2f}s")
     if convergence_history:
@@ -502,6 +569,12 @@ def main() -> None:
                 if vm.get("bd_asr") is not None:
                     extra_val += f", bd_ASR={vm['bd_asr']*100:.2f}%"
                 print(f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}%{extra_train} | Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%{extra_val}")
+        print("\n===== Poison detection summary (raw vectors) =====")
+        for line in raw_metrics.format_summary("raw_vectors"):
+            print(line)
+        print("\n===== Poison detection summary (orthogonal projection) =====")
+        for line in proj_metrics.format_summary("orthogonal_projection"):
+            print(line)
 
 
 if __name__ == "__main__":

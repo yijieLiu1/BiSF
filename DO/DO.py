@@ -673,7 +673,7 @@ class DO:
         model = self._build_model(self.dataset_name).to(self.device)
         model_seed = 12345 + self.id
         self._reset_model_parameters(model, model_seed)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=5e-4)
         # 不用 scheduler，或者后面按轮更新
         scheduler = None
         self._persist_model = model

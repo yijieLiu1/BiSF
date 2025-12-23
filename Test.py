@@ -318,12 +318,21 @@ def run_federated_simulation(
         print(f"\n===== Round {round_idx}: SafeMul 投影计算（在线 DO）=====")
         t1 = time.time()
         csp.do_projection_map.clear()
+        r1t=time.time()
         ctx = csp.safe_mul_prepare_payload()
+        r1te=time.time()
+        print(f"[Round {round_idx}] SafeMul 准备阶段耗时 {r1te - r1t:.4f}s")
         for do in [d for d in working_do_list if d is not None]:
             b_vec = do.get_last_updates()
             payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
+            r2t=time.time()
             resp = do.safe_mul_round2_process(payload, b_vec)
+            r2te=time.time()
+            print(f"[Round {round_idx}] DO {do.id} SafeMul 第二轮处理耗时 {r2te - r2t:.4f}s")
+
             projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'], do.id)
+            r3t=time.time()
+            print(f"[Round {round_idx}] CSP SafeMul 最终化 DO {do.id} 投影耗时 {r3t - r2te:.4f}s")
             print(f" DO {do.id} 投影向量(长度{len(projection)})")
         t2 = time.time()
         print(f"[Round {round_idx}] SafeMul 投影耗时 {t2 - t1:.4f}s")
@@ -566,10 +575,10 @@ if __name__ == "__main__":
     # 以下保持原默认示例参数，可按需扩展更多 CLI
     # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
     parser.add_argument("--num-rounds", type=int, default=30)#联邦轮次
-    parser.add_argument("--num-do", type=int, default=10)#在线DO数
-    parser.add_argument("--model-size", type=int, default=61706)  # cnn:61706 / lenet:81086 / resnet20:272186
-    parser.add_argument("--model-name", type=str, default="cnn")    #模型名称：cnn /lenet /resnet20
-    parser.add_argument("--dataset-name", type=str, default="mnist")#数据集名称：mnist /cifar10
+    parser.add_argument("--num-do", type=int, default=1)#在线DO数
+    parser.add_argument("--model-size", type=int, default=272186)  # cnn:61706 / lenet:81086 / resnet20:272186
+    parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /lenet /resnet20
+    parser.add_argument("--dataset-name", type=str, default="cifar10")#数据集名称：mnist /cifar10
     # DO 训练相关，batch size / max batches
     parser.add_argument("--train-batch-size", type=int, default=64)#训练batch size
     parser.add_argument("--train-max-batches", type=int, default=300)#训练最大batch数
