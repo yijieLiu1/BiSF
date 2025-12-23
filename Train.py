@@ -82,10 +82,98 @@ def apply_poison(vec: List[float], attack_type: str, attack_lambda: float, attac
     return vec
 
 
+def _build_resnet20_compression_spec(dataset_name: str, target_dim: int, seed: int = 2025) -> Dict[str, object]:
+    """为 ResNet20 构造按层压缩的映射（线性 Hash-Sum），用于检测维度压缩。"""
+    meta = DO._get_dataset_meta(dataset_name)
+    model = DO._ResNet20(in_channels=meta["in_channels"], num_classes=meta["num_classes"])
+    group_order = ("stem", "layer1", "layer2", "layer3", "fc")
+    group_ranges: Dict[str, List[tuple]] = {name: [] for name in group_order}
+
+    offset = 0
+    for name, param in model.named_parameters():
+        numel = param.numel()
+        base = name.split(".")[0]
+        if base in ("conv1", "bn1"):
+            group = "stem"
+        elif base in ("layer1", "layer2", "layer3", "fc"):
+            group = base
+        else:
+            group = "stem"
+        group_ranges[group].append((offset, offset + numel))
+        offset += numel
+
+    input_dim = offset
+    group_sizes = {
+        name: sum(end - start for start, end in ranges) for name, ranges in group_ranges.items()
+    }
+    fc_size = group_sizes["fc"]
+    if target_dim <= fc_size:
+        raise ValueError(f"压缩维度过小: target={target_dim}, fc={fc_size}")
+
+    weights = {"stem": 0.5, "layer1": 0.8, "layer2": 1.0, "layer3": 1.2}
+    compress_total = target_dim - fc_size
+    weighted = {k: group_sizes[k] * weights[k] for k in weights}
+    weight_sum = sum(weighted.values())
+    raw_alloc = {k: (compress_total * weighted[k] / weight_sum) for k in weighted}
+    alloc = {k: max(1, int(raw_alloc[k])) for k in weighted}
+    remain = compress_total - sum(alloc.values())
+    if remain > 0:
+        frac = sorted(((raw_alloc[k] - alloc[k], k) for k in weighted), reverse=True)
+        for i in range(remain):
+            alloc[frac[i % len(frac)][1]] += 1
+
+    group_specs = []
+    out_offset = 0
+    for name in group_order:
+        size = group_sizes[name]
+        if name == "fc":
+            out_size = size
+            bucket = list(range(size))
+            sign = [1] * size
+        else:
+            out_size = min(size, alloc[name])
+            group_seed = seed + sum(ord(c) for c in name)
+            rng = random.Random(group_seed)
+            bucket = [rng.randrange(out_size) for _ in range(size)]
+            # 只做纯求和，保证压缩后求和与原始全量求和一致
+            sign = [1] * size
+        group_specs.append(
+            {
+                "name": name,
+                "ranges": group_ranges[name],
+                "in_size": size,
+                "out_offset": out_offset,
+                "out_size": out_size,
+                "bucket": bucket,
+                "sign": sign,
+            }
+        )
+        out_offset += out_size
+
+    return {"input_dim": input_dim, "compressed_dim": out_offset, "groups": group_specs}
+
+
+def _compress_vector(vec: List[float], spec: Dict[str, object]) -> List[float]:
+    """按映射压缩向量（线性 Hash-Sum），用于检测维度缩减。"""
+    if len(vec) != spec["input_dim"]:
+        raise ValueError(f"压缩向量长度不匹配: {len(vec)} != {spec['input_dim']}")
+    out = [0.0] * spec["compressed_dim"]
+    for group in spec["groups"]:
+        out_offset = group["out_offset"]
+        bucket = group["bucket"]
+        sign = group["sign"]
+        pos = 0
+        for start, end in group["ranges"]:
+            for i in range(end - start):
+                out[out_offset + bucket[pos]] += sign[pos] * vec[start + i]
+                pos += 1
+    return out
+
+
 def main() -> None:
     #MNIST训练集按照batchsize=128时，大约切成468个batch，每个DO取400个batch进行训练，相当于差不多一次一个DO跑一个epoch
     parser = argparse.ArgumentParser(description="DO 明文训练（支持投毒），输出全局参数")
-    parser.add_argument("--rounds", type=int, default=50, help="训练轮数")
+    parser.add_argument("--rounds", type=int, default=20, help="训练轮数")
     parser.add_argument("--num-do", type=int, default=10, help="DO 数量")
     parser.add_argument("--model-name", type=str, default="resnet20", help="模型名称（cnn/lenet/resnet20，对应 LeNet-5 或 ResNet20）")
     parser.add_argument("--dataset-name", type=str, default="cifar10", help="数据集名称（mnist/cifar10）")
@@ -93,9 +181,9 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
     parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 训练数据的 IID/non-IID 程度）",)
     # target label flip 投毒设置（与 Test.py 对齐）
-    parser.add_argument("--poison-do-id",type=str,default="0,1",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
+    parser.add_argument("--poison-do-id",type=str,default="1,3",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
     parser.add_argument("--source-label", type=int, default=1, help="若需 label flip，指定源标签")
-    parser.add_argument("--target-label", type=int, default=99, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
+    parser.add_argument("--target-label", type=int, default=9, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
     parser.add_argument("--attack-rounds",type=str,default="all",help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发",)
     parser.add_argument("--poison-ratio",type=float,default=1.0,help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）",)
     # 梯度投毒设置（stealth/random/signflip/lie_stat）
@@ -116,6 +204,8 @@ def main() -> None:
     parser.add_argument("--eval-batch-size", type=int, default=256, help="每轮推理评估批大小")
     parser.add_argument("--eval-batches", type=int, default=50, help="每轮评估使用的批次数上限（train/val）")
     parser.add_argument("--bn-calib-batches", type=int, default=30, help="BN 校准用的训练批次数（仅 resnet 有效）")
+    parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="是否启用压缩向量投毒检测（仅 ResNet20 有效）")
+    parser.add_argument("--compressed-dim", type=int, default=8000, help="压缩后的检测维度（建议 75k-85k）")
     args = parser.parse_args()
 
     # 解析 target label flip 轮次
@@ -148,6 +238,13 @@ def main() -> None:
 
     model_size = infer_model_size(args.model_name, args.dataset_name)
     print(f"[Train] 模型参数量估计: {model_size}")
+    compression_spec = None
+    if args.enable_compressed_detect and args.model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
+        compression_spec = _build_resnet20_compression_spec(args.dataset_name, args.compressed_dim, seed=2025)
+        print(
+            f"[Train] 启用压缩检测：原始维度 {compression_spec['input_dim']} -> "
+            f"{compression_spec['compressed_dim']}"
+        )
     # 构建 TA：用于 DO 初始化与正交向量生成（与 Test.py 保持一致，使用 2048 维投影）
     ta = TA(num_do=args.num_do, model_size=model_size, orthogonal_vector_count=1024, bit_length=512)
 
@@ -203,11 +300,15 @@ def main() -> None:
     round_times = []
     detection_logs_raw: List[Dict[str, str]] = []
     detection_logs_proj: List[Dict[str, str]] = []
+    detection_logs_comp_raw: List[Dict[str, str]] = []
+    detection_logs_comp_proj: List[Dict[str, str]] = []
     best_params = None
     best_val_acc = -1.0
     detection_methods = ("multi_krum", "geomedian", "clustering")
     raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
+    comp_raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
+    comp_proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
 
 
     def _run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> Dict[str, object]:
@@ -328,6 +429,16 @@ def main() -> None:
             raw_metrics.update(
                 method, r, raw_suspects.get(method), poisoned_ids, active_ids
             )
+        compressed_updates = None
+        if compression_spec is not None:
+            compressed_updates = {do_id: _compress_vector(vec, compression_spec) for do_id, vec in updates.items()}
+            det_comp_raw = _run_detection_suite(compressed_updates, "compressed_raw_vectors")
+            detection_logs_comp_raw.append({"round": r, "log": det_comp_raw["log"]})
+            comp_raw_suspects = det_comp_raw.get("suspects", {})
+            for method in detection_methods:
+                comp_raw_metrics.update(
+                    method, r, comp_raw_suspects.get(method), poisoned_ids, active_ids
+                )
 
         # 使用 TA 生成的完整正交向量组 U（形状约为 2048×model_size），直接做明文点积 w·U 得到 2048 维投影
         print(f"\n===== Round {r}: 正交投影计算（Plain，在线 DO）=====")
@@ -355,6 +466,25 @@ def main() -> None:
                 proj_metrics.update(
                     method, r, proj_suspects.get(method), poisoned_ids, proj_active_ids
                 )
+            if compression_spec is not None and compressed_updates is not None:
+                comp_proj_map: Dict[int, List[float]] = {}
+                comp_U = [_compress_vector(u_vec, compression_spec) for u_vec in U]
+                for do_id, vec in compressed_updates.items():
+                    proj: List[float] = []
+                    for u_vec in comp_U:
+                        s = 0.0
+                        for x, y in zip(vec, u_vec):
+                            s += x * y
+                        proj.append(s)
+                    comp_proj_map[do_id] = proj
+                det_comp_proj = _run_detection_suite(comp_proj_map, "compressed_orthogonal_projection", temporary=True)
+                detection_logs_comp_proj.append({"round": r, "log": det_comp_proj["log"]})
+                comp_active_ids = list(comp_proj_map.keys())
+                comp_suspects = det_comp_proj.get("suspects", {})
+                for method in detection_methods:
+                    comp_proj_metrics.update(
+                        method, r, comp_suspects.get(method), poisoned_ids, comp_active_ids
+                    )
         t2 = time.time()
         print(f"[Train][Round {r}] 正交投影耗时 {t2 - t1:.4f}s")
 
@@ -544,10 +674,25 @@ def main() -> None:
             for item in detection_logs_proj:
                 f.write(f"[Round {item['round']}]\n{item['log']}\n")
             f.write("\n")
+        if compression_spec is not None and detection_logs_comp_raw:
+            f.write("投毒检测日志（压缩原始向量，Plain）:\n")
+            for item in detection_logs_comp_raw:
+                f.write(f"[Round {item['round']}]\n{item['log']}\n")
+            f.write("\n")
+        if compression_spec is not None and detection_logs_comp_proj:
+            f.write("投毒检测日志（压缩正交投影向量，Plain）:\n")
+            for item in detection_logs_comp_proj:
+                f.write(f"[Round {item['round']}]\n{item['log']}\n")
+            f.write("\n")
         for line in raw_metrics.format_summary("raw_vectors"):
             f.write(line + "\n")
         for line in proj_metrics.format_summary("orthogonal_projection"):
             f.write(line + "\n")
+        if compression_spec is not None:
+            for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+                f.write(line + "\n")
+            for line in comp_proj_metrics.format_summary("compressed_orthogonal_projection"):
+                f.write(line + "\n")
         f.write("\n")
     print(f"[Train] 日志已保存: {log_path}")
     print(f"[Train] 总用时: {total_elapsed:.2f}s")
@@ -575,6 +720,13 @@ def main() -> None:
         print("\n===== Poison detection summary (orthogonal projection) =====")
         for line in proj_metrics.format_summary("orthogonal_projection"):
             print(line)
+        if compression_spec is not None:
+            print("\n===== Poison detection summary (compressed raw vectors) =====")
+            for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+                print(line)
+            print("\n===== Poison detection summary (compressed orthogonal projection) =====")
+            for line in comp_proj_metrics.format_summary("compressed_orthogonal_projection"):
+                print(line)
 
 
 if __name__ == "__main__":
