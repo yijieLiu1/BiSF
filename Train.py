@@ -16,6 +16,9 @@ from typing import List, Optional, Dict
 import time
 import io
 import contextlib
+import math
+import torch
+import numpy as np
 
 from TA.TA import TA
 from DO.DO import DO  # 复用模型与数据集工厂
@@ -82,92 +85,74 @@ def apply_poison(vec: List[float], attack_type: str, attack_lambda: float, attac
     return vec
 
 
-def _build_resnet20_compression_spec(dataset_name: str, target_dim: int, seed: int = 2025) -> Dict[str, object]:
-    """为 ResNet20 构造按层压缩的映射（线性 Hash-Sum），用于检测维度压缩。"""
+def _build_resnet20_compression_spec(dataset_name: str, target_dim: int) -> Dict[str, object]:
+    """构造 ResNet20 的检测特征提取规格：FC + 全量 BN gamma/beta + Stage3 通道范数。"""
     meta = DO._get_dataset_meta(dataset_name)
     model = DO._ResNet20(in_channels=meta["in_channels"], num_classes=meta["num_classes"])
-    group_order = ("stem", "layer1", "layer2", "layer3", "fc")
-    group_ranges: Dict[str, List[tuple]] = {name: [] for name in group_order}
+    bn_modules = {name for name, module in model.named_modules() if isinstance(module, torch.nn.BatchNorm2d)}
+    fc_ranges: List[tuple] = []
+    bn_ranges: List[tuple] = []
+    stage3_convs: List[Dict[str, object]] = []
 
     offset = 0
     for name, param in model.named_parameters():
+        shape = tuple(param.shape)
         numel = param.numel()
-        base = name.split(".")[0]
-        if base in ("conv1", "bn1"):
-            group = "stem"
-        elif base in ("layer1", "layer2", "layer3", "fc"):
-            group = base
-        else:
-            group = "stem"
-        group_ranges[group].append((offset, offset + numel))
+        module_name = name.rsplit(".", 1)[0]
+        if module_name == "fc":
+            fc_ranges.append((offset, offset + numel))
+        if module_name in bn_modules:
+            bn_ranges.append((offset, offset + numel))
+        if module_name.startswith("layer3") and "conv" in module_name and len(shape) == 4:
+            stage3_convs.append({"start": offset, "shape": shape})
         offset += numel
 
-    input_dim = offset
-    group_sizes = {
-        name: sum(end - start for start, end in ranges) for name, ranges in group_ranges.items()
+    compressed_dim = sum(end - start for start, end in fc_ranges)
+    compressed_dim += sum(end - start for start, end in bn_ranges)
+    compressed_dim += sum(int(item["shape"][0]) for item in stage3_convs)
+
+    return {
+        "input_dim": offset,
+        "compressed_dim": compressed_dim,
+        "fc_ranges": fc_ranges,
+        "bn_ranges": bn_ranges,
+        "stage3_convs": stage3_convs,
+        "target_dim": target_dim,
     }
-    fc_size = group_sizes["fc"]
-    if target_dim <= fc_size:
-        raise ValueError(f"压缩维度过小: target={target_dim}, fc={fc_size}")
-
-    weights = {"stem": 0.5, "layer1": 0.8, "layer2": 1.0, "layer3": 1.2}
-    compress_total = target_dim - fc_size
-    weighted = {k: group_sizes[k] * weights[k] for k in weights}
-    weight_sum = sum(weighted.values())
-    raw_alloc = {k: (compress_total * weighted[k] / weight_sum) for k in weighted}
-    alloc = {k: max(1, int(raw_alloc[k])) for k in weighted}
-    remain = compress_total - sum(alloc.values())
-    if remain > 0:
-        frac = sorted(((raw_alloc[k] - alloc[k], k) for k in weighted), reverse=True)
-        for i in range(remain):
-            alloc[frac[i % len(frac)][1]] += 1
-
-    group_specs = []
-    out_offset = 0
-    for name in group_order:
-        size = group_sizes[name]
-        if name == "fc":
-            out_size = size
-            bucket = list(range(size))
-            sign = [1] * size
-        else:
-            out_size = min(size, alloc[name])
-            group_seed = seed + sum(ord(c) for c in name)
-            rng = random.Random(group_seed)
-            bucket = [rng.randrange(out_size) for _ in range(size)]
-            # 只做纯求和，保证压缩后求和与原始全量求和一致
-            sign = [1] * size
-        group_specs.append(
-            {
-                "name": name,
-                "ranges": group_ranges[name],
-                "in_size": size,
-                "out_offset": out_offset,
-                "out_size": out_size,
-                "bucket": bucket,
-                "sign": sign,
-            }
-        )
-        out_offset += out_size
-
-    return {"input_dim": input_dim, "compressed_dim": out_offset, "groups": group_specs}
 
 
 def _compress_vector(vec: List[float], spec: Dict[str, object]) -> List[float]:
-    """按映射压缩向量（线性 Hash-Sum），用于检测维度缩减。"""
+    """提取 ResNet20 检测特征：FC + BN gamma/beta + Stage3 通道范数。"""
     if len(vec) != spec["input_dim"]:
         raise ValueError(f"压缩向量长度不匹配: {len(vec)} != {spec['input_dim']}")
-    out = [0.0] * spec["compressed_dim"]
-    for group in spec["groups"]:
-        out_offset = group["out_offset"]
-        bucket = group["bucket"]
-        sign = group["sign"]
-        pos = 0
-        for start, end in group["ranges"]:
-            for i in range(end - start):
-                out[out_offset + bucket[pos]] += sign[pos] * vec[start + i]
-                pos += 1
+    out: List[float] = []
+    for start, end in spec["fc_ranges"]:
+        out.extend(vec[start:end])
+    for start, end in spec["bn_ranges"]:
+        out.extend(vec[start:end])
+    for item in spec["stage3_convs"]:
+        start = int(item["start"])
+        shape = item["shape"]
+        out_channels = int(shape[0])
+        per_channel = int(shape[1] * shape[2] * shape[3])
+        for oc in range(out_channels):
+            base = start + oc * per_channel
+            s = 0.0
+            for i in range(per_channel):
+                v = vec[base + i]
+                s += v * v
+            out.append(math.sqrt(s))
     return out
+
+
+def _generate_orthogonal_vectors(dim: int, count: int, seed: int) -> List[List[float]]:
+    """在指定维度生成正交向量组（count 个向量，dim 维）。"""
+    if dim <= 0 or count <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    mat = rng.standard_normal((dim, count))
+    q, _ = np.linalg.qr(mat, mode="reduced")
+    return [q[:, i].astype(float).tolist() for i in range(count)]
 
 
 def main() -> None:
@@ -181,9 +166,9 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
     parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 训练数据的 IID/non-IID 程度）",)
     # target label flip 投毒设置（与 Test.py 对齐）
-    parser.add_argument("--poison-do-id",type=str,default="1,3",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
-    parser.add_argument("--source-label", type=int, default=1, help="若需 label flip，指定源标签")
-    parser.add_argument("--target-label", type=int, default=9, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
+    parser.add_argument("--poison-do-id",type=str,default="1,3,5",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
+    parser.add_argument("--source-label", type=int, default=None, help="若需 label flip，指定源标签")
+    parser.add_argument("--target-label", type=int, default=None, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
     parser.add_argument("--attack-rounds",type=str,default="all",help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发",)
     parser.add_argument("--poison-ratio",type=float,default=1.0,help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）",)
     # 梯度投毒设置（stealth/random/signflip/lie_stat）
@@ -192,10 +177,10 @@ def main() -> None:
     parser.add_argument("--attack-lambda", type=float, default=0.25, help="投毒放大系数")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="随机投毒的标准差")
     # backdoor (BadNets-style) 配置
-    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=False,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
+    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=True,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
     parser.add_argument("--bd-target-label", type=int, default=9, help="backdoor 目标标签")
     parser.add_argument("--bd-ratio", type=float, default=0.3, help="backdoor 在源标签样本中的注入比例")
-    parser.add_argument("--bd-trigger-size", type=int, default=3, help="触发器方块尺寸（像素）")
+    parser.add_argument("--bd-trigger-size", type=int, default=2, help="触发器方块尺寸（像素）")
     parser.add_argument("--bd-trigger-value", type=float, default=3.0, help="触发器像素值（归一化前）")
     #结果保存（Plain 明文训练结果，文件名中带 plain 以便区分加密版本）
     parser.add_argument("--save-path",type=str,default=None,help="保存目录（默认按 {model}_{dataset}_{numdo}do_{attack}_{rounds}r_plain 自动生成）",)
@@ -205,7 +190,7 @@ def main() -> None:
     parser.add_argument("--eval-batches", type=int, default=50, help="每轮评估使用的批次数上限（train/val）")
     parser.add_argument("--bn-calib-batches", type=int, default=30, help="BN 校准用的训练批次数（仅 resnet 有效）")
     parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="是否启用压缩向量投毒检测（仅 ResNet20 有效）")
-    parser.add_argument("--compressed-dim", type=int, default=8000, help="压缩后的检测维度（建议 75k-85k）")
+    parser.add_argument("--compressed-dim", type=int, default=8000, help="压缩检测特征目标维度（仅用于对比打印）")
     args = parser.parse_args()
 
     # 解析 target label flip 轮次
@@ -240,10 +225,10 @@ def main() -> None:
     print(f"[Train] 模型参数量估计: {model_size}")
     compression_spec = None
     if args.enable_compressed_detect and args.model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
-        compression_spec = _build_resnet20_compression_spec(args.dataset_name, args.compressed_dim, seed=2025)
+        compression_spec = _build_resnet20_compression_spec(args.dataset_name, args.compressed_dim)
         print(
             f"[Train] 启用压缩检测：原始维度 {compression_spec['input_dim']} -> "
-            f"{compression_spec['compressed_dim']}"
+            f"{compression_spec['compressed_dim']} (目标 {compression_spec['target_dim']})"
         )
     # 构建 TA：用于 DO 初始化与正交向量生成（与 Test.py 保持一致，使用 2048 维投影）
     ta = TA(num_do=args.num_do, model_size=model_size, orthogonal_vector_count=1024, bit_length=512)
@@ -468,7 +453,8 @@ def main() -> None:
                 )
             if compression_spec is not None and compressed_updates is not None:
                 comp_proj_map: Dict[int, List[float]] = {}
-                comp_U = [_compress_vector(u_vec, compression_spec) for u_vec in U]
+                comp_dim = compression_spec["compressed_dim"]
+                comp_U = _generate_orthogonal_vectors(comp_dim, len(U), seed=2025 + r)
                 for do_id, vec in compressed_updates.items():
                     proj: List[float] = []
                     for u_vec in comp_U:
