@@ -25,6 +25,7 @@ from DO.DO import DO  # 复用模型与数据集工厂
 from CSP.CSP import CSP  # 复用投毒检测逻辑（Multi-Krum / GeoMedian / Cluster / LASA-lite）
 import ModelTest  # 复用评估逻辑
 from utils.detection_metrics import DetectionMetricsTracker
+from utils.logging_utils import write_train_log
 
 
 def infer_model_size(model_name: str, dataset_name: str) -> int:
@@ -85,7 +86,7 @@ def apply_poison(vec: List[float], attack_type: str, attack_lambda: float, attac
     return vec
 
 
-def _build_resnet20_compression_spec(dataset_name: str, target_dim: int) -> Dict[str, object]:
+def _build_resnet20_compression_spec(dataset_name: str) -> Dict[str, object]:
     """构造 ResNet20 的检测特征提取规格：FC + 全量 BN gamma/beta + Stage3 通道范数。"""
     meta = DO._get_dataset_meta(dataset_name)
     model = DO._ResNet20(in_channels=meta["in_channels"], num_classes=meta["num_classes"])
@@ -117,7 +118,6 @@ def _build_resnet20_compression_spec(dataset_name: str, target_dim: int) -> Dict
         "fc_ranges": fc_ranges,
         "bn_ranges": bn_ranges,
         "stage3_convs": stage3_convs,
-        "target_dim": target_dim,
     }
 
 
@@ -143,16 +143,6 @@ def _compress_vector(vec: List[float], spec: Dict[str, object]) -> List[float]:
                 s += v * v
             out.append(math.sqrt(s))
     return out
-
-
-def _generate_orthogonal_vectors(dim: int, count: int, seed: int) -> List[List[float]]:
-    """在指定维度生成正交向量组（count 个向量，dim 维）。"""
-    if dim <= 0 or count <= 0:
-        return []
-    rng = np.random.default_rng(seed)
-    mat = rng.standard_normal((dim, count))
-    q, _ = np.linalg.qr(mat, mode="reduced")
-    return [q[:, i].astype(float).tolist() for i in range(count)]
 
 
 def main() -> None:
@@ -190,7 +180,6 @@ def main() -> None:
     parser.add_argument("--eval-batches", type=int, default=50, help="每轮评估使用的批次数上限（train/val）")
     parser.add_argument("--bn-calib-batches", type=int, default=30, help="BN 校准用的训练批次数（仅 resnet 有效）")
     parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="是否启用压缩向量投毒检测（仅 ResNet20 有效）")
-    parser.add_argument("--compressed-dim", type=int, default=8000, help="压缩检测特征目标维度（仅用于对比打印）")
     args = parser.parse_args()
 
     # 解析 target label flip 轮次
@@ -225,10 +214,10 @@ def main() -> None:
     print(f"[Train] 模型参数量估计: {model_size}")
     compression_spec = None
     if args.enable_compressed_detect and args.model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
-        compression_spec = _build_resnet20_compression_spec(args.dataset_name, args.compressed_dim)
+        compression_spec = _build_resnet20_compression_spec(args.dataset_name)
         print(
             f"[Train] 启用压缩检测：原始维度 {compression_spec['input_dim']} -> "
-            f"{compression_spec['compressed_dim']} (目标 {compression_spec['target_dim']})"
+            f"{compression_spec['compressed_dim']}"
         )
     # 构建 TA：用于 DO 初始化与正交向量生成（与 Test.py 保持一致，使用 2048 维投影）
     ta = TA(num_do=args.num_do, model_size=model_size, orthogonal_vector_count=1024, bit_length=512)
@@ -286,14 +275,12 @@ def main() -> None:
     detection_logs_raw: List[Dict[str, str]] = []
     detection_logs_proj: List[Dict[str, str]] = []
     detection_logs_comp_raw: List[Dict[str, str]] = []
-    detection_logs_comp_proj: List[Dict[str, str]] = []
     best_params = None
     best_val_acc = -1.0
     detection_methods = ("multi_krum", "geomedian", "clustering")
     raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     comp_raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
-    comp_proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
 
 
     def _run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> Dict[str, object]:
@@ -451,26 +438,6 @@ def main() -> None:
                 proj_metrics.update(
                     method, r, proj_suspects.get(method), poisoned_ids, proj_active_ids
                 )
-            if compression_spec is not None and compressed_updates is not None:
-                comp_proj_map: Dict[int, List[float]] = {}
-                comp_dim = compression_spec["compressed_dim"]
-                comp_U = _generate_orthogonal_vectors(comp_dim, len(U), seed=2025 + r)
-                for do_id, vec in compressed_updates.items():
-                    proj: List[float] = []
-                    for u_vec in comp_U:
-                        s = 0.0
-                        for x, y in zip(vec, u_vec):
-                            s += x * y
-                        proj.append(s)
-                    comp_proj_map[do_id] = proj
-                det_comp_proj = _run_detection_suite(comp_proj_map, "compressed_orthogonal_projection", temporary=True)
-                detection_logs_comp_proj.append({"round": r, "log": det_comp_proj["log"]})
-                comp_active_ids = list(comp_proj_map.keys())
-                comp_suspects = det_comp_proj.get("suspects", {})
-                for method in detection_methods:
-                    comp_proj_metrics.update(
-                        method, r, comp_suspects.get(method), poisoned_ids, comp_active_ids
-                    )
         t2 = time.time()
         print(f"[Train][Round {r}] 正交投影耗时 {t2 - t1:.4f}s")
 
@@ -623,63 +590,24 @@ def main() -> None:
         )
         print(f"[Train] 最优参数已保存: {best_path}")
     # 保存日志（收敛、评估、用时）
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"总用时: {total_elapsed:.2f}s\n")
-        f.write("按轮用时(s): " + ", ".join(f"{t:.2f}" for t in round_times) + "\n\n")
-        if convergence_history:
-            f.write("收敛指标（ΔL2, ΔL∞）:\n")
-            for item in convergence_history:
-                f.write(f"Round {item['round']}: L2={item['l2']:.6f}, L∞={item['linf']:.6f}\n")
-            f.write("\n")
-        if train_metric_history and val_metric_history:
-            f.write("训练/验证指标:\n")
-            for tm, vm in zip(train_metric_history, val_metric_history):
-                extra_train = ""
-                extra_val = ""
-                if tm.get("asr") is not None and tm.get("src_acc") is not None:
-                    extra_train = f", ASR={tm['asr']*100:.2f}%, src_acc={tm['src_acc']*100:.2f}%"
-                if tm.get("bd_asr") is not None:
-                    extra_train += f", bd_ASR={tm['bd_asr']*100:.2f}%"
-                if vm.get("asr") is not None and vm.get("src_acc") is not None:
-                    extra_val = f", ASR={vm['asr']*100:.2f}%, src_acc={vm['src_acc']*100:.2f}%"
-                if vm.get("bd_asr") is not None:
-                    extra_val += f", bd_ASR={vm['bd_asr']*100:.2f}%"
-                f.write(
-                    f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}%{extra_train} | "
-                    f"Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%{extra_val}\n"
-                )
-        f.write("\n")
-        # 记录 Plain 版本的投毒检测日志（原始向量 / 正交投影）
-        if detection_logs_raw:
-            f.write("投毒检测日志（原始向量，Plain）:\n")
-            for item in detection_logs_raw:
-                f.write(f"[Round {item['round']}]\n{item['log']}\n")
-            f.write("\n")
-        if detection_logs_proj:
-            f.write("投毒检测日志（正交投影向量，Plain）:\n")
-            for item in detection_logs_proj:
-                f.write(f"[Round {item['round']}]\n{item['log']}\n")
-            f.write("\n")
-        if compression_spec is not None and detection_logs_comp_raw:
-            f.write("投毒检测日志（压缩原始向量，Plain）:\n")
-            for item in detection_logs_comp_raw:
-                f.write(f"[Round {item['round']}]\n{item['log']}\n")
-            f.write("\n")
-        if compression_spec is not None and detection_logs_comp_proj:
-            f.write("投毒检测日志（压缩正交投影向量，Plain）:\n")
-            for item in detection_logs_comp_proj:
-                f.write(f"[Round {item['round']}]\n{item['log']}\n")
-            f.write("\n")
-        for line in raw_metrics.format_summary("raw_vectors"):
-            f.write(line + "\n")
-        for line in proj_metrics.format_summary("orthogonal_projection"):
-            f.write(line + "\n")
-        if compression_spec is not None:
-            for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
-                f.write(line + "\n")
-            for line in comp_proj_metrics.format_summary("compressed_orthogonal_projection"):
-                f.write(line + "\n")
-        f.write("\n")
+    summary_lines = []
+    summary_lines.extend(raw_metrics.format_summary("raw_vectors"))
+    summary_lines.extend(proj_metrics.format_summary("orthogonal_projection"))
+    if compression_spec is not None:
+        summary_lines.extend(comp_raw_metrics.format_summary("compressed_raw_vectors"))
+    write_train_log(
+        log_path=str(log_path),
+        total_elapsed=total_elapsed,
+        round_times=round_times,
+        convergence_history=convergence_history,
+        train_metric_history=train_metric_history,
+        val_metric_history=val_metric_history,
+        detection_logs_raw=detection_logs_raw,
+        detection_logs_proj=detection_logs_proj,
+        detection_logs_comp_raw=detection_logs_comp_raw if compression_spec is not None else None,
+        detection_logs_comp_proj=None,
+        detection_summary_lines=summary_lines,
+    )
     print(f"[Train] 日志已保存: {log_path}")
     print(f"[Train] 总用时: {total_elapsed:.2f}s")
     if convergence_history:
@@ -709,9 +637,6 @@ def main() -> None:
         if compression_spec is not None:
             print("\n===== Poison detection summary (compressed raw vectors) =====")
             for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
-                print(line)
-            print("\n===== Poison detection summary (compressed orthogonal projection) =====")
-            for line in comp_proj_metrics.format_summary("compressed_orthogonal_projection"):
                 print(line)
 
 

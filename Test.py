@@ -12,6 +12,8 @@ import sys
 import time
 import random
 import math
+import numpy as np
+import torch
 import json
 import argparse
 import io
@@ -25,8 +27,67 @@ from TA.TA import TA
 from CSP.CSP import CSP
 from DO.DO import DO
 import ModelTest
+from utils.detection_metrics import DetectionMetricsTracker
+from utils.logging_utils import write_test_log
 
 # 默认参数。作为“库函数”时可单独调用；命令行入口会显式传入同名参数（保持默认值一致）。
+def _build_resnet20_compression_spec(dataset_name: str) -> Dict[str, object]:
+    """Build ResNet20 compression spec: FC + BN gamma/beta + stage3 channel norms."""
+    meta = DO._get_dataset_meta(dataset_name)
+    model = DO._ResNet20(in_channels=meta["in_channels"], num_classes=meta["num_classes"])
+    bn_modules = {name for name, module in model.named_modules() if isinstance(module, torch.nn.BatchNorm2d)}
+    fc_ranges: List[tuple] = []
+    bn_ranges: List[tuple] = []
+    stage3_convs: List[Dict[str, object]] = []
+
+    offset = 0
+    for name, param in model.named_parameters():
+        shape = tuple(param.shape)
+        numel = param.numel()
+        module_name = name.rsplit(".", 1)[0]
+        if module_name == "fc":
+            fc_ranges.append((offset, offset + numel))
+        if module_name in bn_modules:
+            bn_ranges.append((offset, offset + numel))
+        if module_name.startswith("layer3") and "conv" in module_name and len(shape) == 4:
+            stage3_convs.append({"start": offset, "shape": shape})
+        offset += numel
+
+    compressed_dim = sum(end - start for start, end in fc_ranges)
+    compressed_dim += sum(end - start for start, end in bn_ranges)
+    compressed_dim += sum(int(item["shape"][0]) for item in stage3_convs)
+
+    return {
+        "input_dim": offset,
+        "compressed_dim": compressed_dim,
+        "fc_ranges": fc_ranges,
+        "bn_ranges": bn_ranges,
+        "stage3_convs": stage3_convs,
+    }
+
+def _compress_vector(vec: List[float], spec: Dict[str, object]) -> List[float]:
+    """Extract compressed vector features for ResNet20 detection."""
+    if len(vec) != spec["input_dim"]:
+        raise ValueError(f"Compressed vector length mismatch: {len(vec)} != {spec['input_dim']}")
+    out: List[float] = []
+    for start, end in spec["fc_ranges"]:
+        out.extend(vec[start:end])
+    for start, end in spec["bn_ranges"]:
+        out.extend(vec[start:end])
+    for item in spec["stage3_convs"]:
+        start = int(item["start"])
+        shape = item["shape"]
+        out_channels = int(shape[0])
+        per_channel = int(shape[1] * shape[2] * shape[3])
+        for oc in range(out_channels):
+            base = start + oc * per_channel
+            s = 0.0
+            for i in range(per_channel):
+                v = vec[base + i]
+                s += v * v
+            out.append(math.sqrt(s))
+    return out
+
 def run_federated_simulation(
     num_rounds: int = 30,
     num_do: int = 10,
@@ -68,6 +129,12 @@ def run_federated_simulation(
     poison_ratio: float = 0.3,
     # untarget 梯度/参数投毒的轮次配置："all" / List[int] / 单个 int / None
     attack_rounds_untarget: Optional[object] = "all",
+    bd_enable: bool = True,
+    bd_target_label: Optional[int] = 9,
+    bd_ratio: float = 0.3,
+    bd_trigger_size: int = 2,
+    bd_trigger_value: float = 3.0,
+    enable_compressed_detect: bool = True,
 ) -> None:
     """
     运行一次联邦学习流程。
@@ -140,65 +207,98 @@ def run_federated_simulation(
         precision=precision,
     )
     csp = CSP(ta, model_size=model_size, precision=precision, initial_params_path=initial_params_path)
+    compression_spec = None
+    if enable_compressed_detect and model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
+        compression_spec = _build_resnet20_compression_spec(dataset_name)
+        print(
+            f"[Test] 启用压缩检测：原始维度 {compression_spec['input_dim']} -> "
+            f"{compression_spec['compressed_dim']}"
+        )
     attack_do_ids = attack_do_ids or []
 
-    do_list: List[Optional[DO]] = [
-        DO(
-            i,
-            ta,
-            model_size=model_size,
-            precision=precision,
-            model_name=model_name,
-            dataset_name=dataset_name,
-            batch_size=train_batch_size,
-            max_batches=train_max_batches,
-            partition_mode=partition_mode,
-            attack_config=({
-                "attack_type": "label_flip",
-                "attacker_do_id": i,
-                "attack_rounds": attack_rounds if attack_rounds else "all",
-                "source_label": source_label,
-                "target_label": target_label,
-                "poison_ratio": poison_ratio,
-            } if (source_label is not None and target_label is not None and i in attack_do_ids) else None),
+    do_list: List[Optional[DO]] = []
+    for i in range(num_do):
+        attack_cfg: Dict[str, object] = {}
+        if source_label is not None and target_label is not None and i in attack_do_ids:
+            attack_cfg.update(
+                {
+                    "attack_type": "label_flip",
+                    "attacker_do_id": i,
+                    "attack_rounds": attack_rounds if attack_rounds else "all",
+                    "source_label": source_label,
+                    "target_label": target_label,
+                    "poison_ratio": poison_ratio,
+                }
+            )
+        if bd_enable and bd_target_label is not None and i in attack_do_ids:
+            attack_cfg.update(
+                {
+                    "bd_enable": True,
+                    "bd_target_label": bd_target_label,
+                    "bd_ratio": bd_ratio,
+                    "bd_trigger_size": bd_trigger_size,
+                    "bd_trigger_value": bd_trigger_value,
+                }
+            )
+        do_list.append(
+            DO(
+                i,
+                ta,
+                model_size=model_size,
+                precision=precision,
+                model_name=model_name,
+                dataset_name=dataset_name,
+                batch_size=train_batch_size,
+                max_batches=train_max_batches,
+                partition_mode=partition_mode,
+                attack_config=attack_cfg if attack_cfg else None,
+            )
         )
-        for i in range(num_do)
-    ]
+
     round_stats: List[Dict[str, float]] = []
 
-    def run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> str:
+    def run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> Dict[str, object]:
         if not vector_map:
-            return ""
+            return {"log": "", "suspects": {}}
         backup = None
         if temporary:
             backup = csp.do_projection_map
             csp.do_projection_map = {k: list(v) for k, v in vector_map.items()}
         buf = io.StringIO()
+        suspects_multi: List[int] = []
+        suspects_geo: List[int] = []
+        suspects_cluster: List[int] = []
         with contextlib.redirect_stdout(buf):
-            print(f"\n----- 投毒检测（{label}）-----")
+            print(f"\n----- Detection ({label}) -----")
             active_count = len(csp.do_projection_map)
             if active_count >= 2:
-                #将阈值缩小，更加敏感
-                #f：假定最多有多少恶意 DO（Multi‑Krum 专用）确保n>=2f+3
-                # alpha / beta：阈值敏感度系数（越小越“敏感”）
-                # k：聚类时的簇数
-                # angle_threshold：方向（余弦相似度）的下限阈值0.0，也就是只要方向不是完全“反着来”就不算太离谱；如果想更敏感，可以设为 0.2 / 0.3，表示“必须跟大多数方向比较接近”。
-                csp.detect_poison_multi_krum(f=2, alpha=1.5)
-                csp.detect_poison_geomedian(beta=1.5)
-                csp.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
-                csp.detect_poison_lasa_lite(angle_threshold=0.0, beta=1.5)
+                suspects_multi = csp.detect_poison_multi_krum(f=2, alpha=1.5)
+                suspects_geo = csp.detect_poison_geomedian(beta=1.5)
+                suspects_cluster = csp.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
             else:
-                print("[检测] 在线 DO 数不足，跳过。")
+                print("[Detect] Not enough active DOs, skip.")
         output = buf.getvalue()
         print(output, end="")
         if temporary:
             csp.do_projection_map = backup
-        return output
+        return {
+            "log": output,
+            "suspects": {
+                "multi_krum": suspects_multi,
+                "geomedian": suspects_geo,
+                "clustering": suspects_cluster,
+            },
+        }
 
     round_times = []
     eval_history: List[Dict[str, float]] = []
     detection_logs_raw: List[Dict[str, str]] = []
     detection_logs_proj: List[Dict[str, str]] = []
+    detection_logs_comp_raw: List[Dict[str, str]] = []
+    detection_methods = ("multi_krum", "geomedian", "clustering")
+    raw_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
+    proj_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
+    comp_raw_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
     best_params = None
     best_metric = -1.0  # 优先用 val acc，如果没有则用 train acc
     # 构造统一的运行标签：模型_数据集_do数_场景_轮数
@@ -212,6 +312,8 @@ def run_federated_simulation(
         # untarget 攻击（stealth/random/signflip/lie_stat）：只要 attack_type 与攻击 DO 同时非空，就认为开启
         has_untarget_attack = bool(attack_do_ids) and bool(attack_type)
 
+        has_backdoor = bool(attack_do_ids) and bd_enable
+
         if has_target_attack:
             if attack_rounds == "all":
                 scenario_parts.append("target_labelflip_all")
@@ -222,6 +324,9 @@ def run_federated_simulation(
 
         if has_untarget_attack:
             scenario_parts.append(f"untarget_{attack_type.lower()}")
+
+        if has_backdoor:
+            scenario_parts.append("backdoor")
 
         scenario_tag = "_".join(scenario_parts) if scenario_parts else "normal"
         return f"{model_tag}_{dataset_tag}_{num_do}do_{scenario_tag}_{num_rounds}r"
@@ -242,7 +347,45 @@ def run_federated_simulation(
             return round_idx == attack_round
         return False
 
+    def _should_label_flip_round(round_idx: int, do_id: int) -> bool:
+        if source_label is None or target_label is None:
+            return False
+        if do_id not in attack_do_ids:
+            return False
+        if attack_rounds == "all":
+            return True
+        if isinstance(attack_rounds, list):
+            return round_idx in attack_rounds
+        return False
+
+    def _should_backdoor_round(do_id: int) -> bool:
+        if not bd_enable:
+            return False
+        if do_id not in attack_do_ids:
+            return False
+        if bd_target_label is None:
+            return False
+        if bd_ratio is None or float(bd_ratio) <= 0.0:
+            return False
+        return True
+
+    def _get_poisoned_ids(round_idx: int, active_ids: List[int]) -> set:
+        poisoned = set()
+        for do_id in active_ids:
+            if _should_poison_round(round_idx, do_id):
+                poisoned.add(do_id)
+            if _should_label_flip_round(round_idx, do_id):
+                poisoned.add(do_id)
+            if _should_backdoor_round(do_id):
+                poisoned.add(do_id)
+        return poisoned
+
     for round_idx in range(1, num_rounds + 1):
+        if round_idx > 1:
+            try:
+                ta.update_keys_for_new_round()
+            except Exception as e:
+                print(f"[Test] Round {round_idx} TA refresh failed: {e}")
         round_start = time.time()
         print(f"\n===== Round {round_idx}: 广播参数 =====")
         global_params = csp.broadcast_params()
@@ -310,11 +453,23 @@ def run_federated_simulation(
                         if attacker.training_history:
                             attacker.training_history[-1]['local_updates'] = list(poisoned)
 
+        active_ids = [d.id for d in working_do_list if d is not None]
+        poisoned_ids = _get_poisoned_ids(round_idx, active_ids)
         # 原始向量投毒检测（未映射）
-        det_raw = run_detection_suite(clean_update_map, "原始向量", temporary=True)
-        detection_logs_raw.append({"round": round_idx, "log": det_raw})
+        det_raw = run_detection_suite(clean_update_map, "raw_vectors", temporary=True)
+        detection_logs_raw.append({"round": round_idx, "log": det_raw["log"]})
+        raw_suspects = det_raw.get("suspects", {})
+        for method in detection_methods:
+            raw_metrics.update(method, round_idx, raw_suspects.get(method), poisoned_ids, active_ids)
+        compressed_updates = None
+        if compression_spec is not None:
+            compressed_updates = {do_id: _compress_vector(vec, compression_spec) for do_id, vec in clean_update_map.items()}
+            det_comp_raw = run_detection_suite(compressed_updates, "compressed_raw_vectors", temporary=True)
+            detection_logs_comp_raw.append({"round": round_idx, "log": det_comp_raw["log"]})
+            comp_raw_suspects = det_comp_raw.get("suspects", {})
+            for method in detection_methods:
+                comp_raw_metrics.update(method, round_idx, comp_raw_suspects.get(method), poisoned_ids, active_ids)
 
-        # SafeMul 投影
         print(f"\n===== Round {round_idx}: SafeMul 投影计算（在线 DO）=====")
         t1 = time.time()
         csp.do_projection_map.clear()
@@ -338,52 +493,18 @@ def run_federated_simulation(
         print(f"[Round {round_idx}] SafeMul 投影耗时 {t2 - t1:.4f}s")
 
         # 投毒检测（映射后）
-        det_proj = run_detection_suite(csp.do_projection_map, "正交投影向量", temporary=False)
-        detection_logs_proj.append({"round": round_idx, "log": det_proj})
+        det_proj = run_detection_suite(csp.do_projection_map, "orthogonal_projection", temporary=False)
+        detection_logs_proj.append({"round": round_idx, "log": det_proj["log"]})
+        proj_suspects = det_proj.get("suspects", {})
+        proj_active_ids = list(csp.do_projection_map.keys())
+        for method in detection_methods:
+            proj_metrics.update(method, round_idx, proj_suspects.get(method), poisoned_ids, proj_active_ids)
 
-        # 聚合 + 解密 + 更新
         print(f"\n===== Round {round_idx}: CSP 聚合 + 解密更新 =====")
         updated_params = csp.round_aggregate_and_update(working_do_list, do_cipher_map)
         print(f"[Round {round_idx}] 更新后的全局参数前5: {updated_params[:5]}")
 
         # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
-        if eval_each_round:
-            try:
-                train_loss, train_acc, _, train_asr, train_src_acc, _ = ModelTest.evaluate_params(
-                    updated_params,
-                    model_name=model_name,
-                    dataset_name=dataset_name,
-                    batch_size=eval_batch_size,
-                    max_batches=eval_batches,
-                    data_root=os.path.join(os.path.dirname(__file__), "data"),
-                    split="train",
-                    bn_calib_batches=bn_calib_batches,
-                    source_label=source_label,
-                    target_label=target_label,
-                )
-                val_loss, val_acc, _, val_asr, val_src_acc, _ = ModelTest.evaluate_params(
-                    updated_params,
-                    model_name=model_name,
-                    dataset_name=dataset_name,
-                    batch_size=eval_batch_size,
-                    max_batches=eval_batches,
-                    data_root=os.path.join(os.path.dirname(__file__), "data"),
-                    split="val",
-                    bn_calib_batches=bn_calib_batches,
-                    source_label=source_label,
-                    target_label=target_label,
-                )
-                extra_train = ""
-                extra_val = ""
-                if train_asr is not None and train_src_acc is not None:
-                    extra_train = f", ASR(s->{target_label})={train_asr*100:.2f}%, src_acc={train_src_acc*100:.2f}%"
-                if val_asr is not None and val_src_acc is not None:
-                    extra_val = f", ASR(s->{target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
-                print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}%{extra_train} | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%{extra_val}")
-            except Exception as e:
-                print(f"[Eval][Round {round_idx}] 评估失败: {e}")
-
-        # 训练效果评估（无测试集版本）：看参数值收敛性
         gap = _vector_gap(updated_params, global_params)
         summary = _vector_summary(updated_params)
         cos = _vector_cos(updated_params, global_params)
@@ -416,6 +537,10 @@ def run_federated_simulation(
                     bn_calib_batches=bn_calib_batches,
                     source_label=source_label,
                     target_label=target_label,
+                    bd_target_label=bd_target_label if bd_enable else None,
+                    bd_trigger_size=bd_trigger_size,
+                    bd_trigger_value=bd_trigger_value,
+                    bd_inject_ratio=bd_ratio if bd_enable else 0.0,
                 )
                 val_loss, val_acc, _, val_asr, val_src_acc, val_bd_asr = ModelTest.evaluate_params(
                     updated_params,
@@ -428,6 +553,10 @@ def run_federated_simulation(
                     bn_calib_batches=bn_calib_batches,
                     source_label=source_label,
                     target_label=target_label,
+                    bd_target_label=bd_target_label if bd_enable else None,
+                    bd_trigger_size=bd_trigger_size,
+                    bd_trigger_value=bd_trigger_value,
+                    bd_inject_ratio=bd_ratio if bd_enable else 0.0,
                 )
                 eval_history.append({
                     "round": round_idx,
@@ -483,6 +612,10 @@ def run_federated_simulation(
                 bn_calib_batches=bn_calib_batches,
                 source_label=source_label,
                 target_label=target_label,
+                bd_target_label=bd_target_label if bd_enable else None,
+                bd_trigger_size=bd_trigger_size,
+                bd_trigger_value=bd_trigger_value,
+                bd_inject_ratio=bd_ratio if bd_enable else 0.0,
             )
             extra_val = ""
             if val_asr is not None and val_src_acc is not None:
@@ -536,44 +669,37 @@ def run_federated_simulation(
         base_dir = os.path.join("trainResult", run_tag)
         os.makedirs(base_dir, exist_ok=True)
         log_path = os.path.join(base_dir, "log.txt")
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"总用时: {total_elapsed:.2f}s\n")
-            f.write("按轮用时(s): " + ", ".join(f"{t:.2f}" for t in round_times) + "\n\n")
-            if eval_history:
-                f.write("评估指标（train/val）:\n")
-                for ev in eval_history:
-                    extra_train = ""
-                    extra_val = ""
-                    if ev.get("train_asr") is not None and ev.get("train_src_acc") is not None:
-                        extra_train = f", ASR={ev['train_asr']*100:.2f}%, src_acc={ev['train_src_acc']*100:.2f}%"
-                    if ev.get("val_asr") is not None and ev.get("val_src_acc") is not None:
-                        extra_val = f", ASR={ev['val_asr']*100:.2f}%, src_acc={ev['val_src_acc']*100:.2f}%"
-                    f.write(
-                        f"Round {ev['round']}: Train loss={ev['train_loss']:.4f}, acc={ev['train_acc']*100:.2f}%{extra_train}; "
-                        f"Val loss={ev['val_loss']:.4f}, acc={ev['val_acc']*100:.2f}%{extra_val}\n"
-                    )
-                f.write("\n")
-            if detection_logs_raw:
-                f.write("投毒检测日志（原始向量）:\n")
-                for item in detection_logs_raw:
-                    f.write(f"[Round {item['round']}]\n{item['log']}\n")
-                f.write("\n")
-            if detection_logs_proj:
-                f.write("投毒检测日志（正交投影向量）:\n")
-                for item in detection_logs_proj:
-                    f.write(f"[Round {item['round']}]\n{item['log']}\n")
-                f.write("\n")
-            if round_stats:
-                f.write("收敛指标（ΔL2, ΔL∞）:\n")
-                for stat in round_stats:
-                    f.write(
-                        f"Round {stat['round']}: ΔL2={stat['delta_l2']:.6f}, Δ∞={stat['delta_inf']:.6f}, "
-                        f"cos(prev)={stat['cos']:.6f}, 均值={stat['mean']:.6f}, |max|={stat['abs_max']:.6f}, "
-                        f"proxy_loss={stat['proxy_loss']:.6e}\n"
-                    )
-            print(f"日志已保存: {log_path}")
+        summary_lines = []
+        summary_lines.extend(raw_metrics.format_summary("raw_vectors"))
+        summary_lines.extend(proj_metrics.format_summary("orthogonal_projection"))
+        if compression_spec is not None:
+            summary_lines.extend(comp_raw_metrics.format_summary("compressed_raw_vectors"))
+        write_test_log(
+            log_path=log_path,
+            total_elapsed=total_elapsed,
+            round_times=round_times,
+            eval_history=eval_history,
+            detection_logs_raw=detection_logs_raw,
+            detection_logs_proj=detection_logs_proj,
+            round_stats=round_stats,
+            detection_logs_comp_raw=detection_logs_comp_raw if compression_spec is not None else None,
+            detection_logs_comp_proj=None,
+            detection_summary_lines=summary_lines,
+        )
+        print(f"Log saved: {log_path}")
     except Exception as e:
         print(f"保存日志失败: {e}")
+
+    print("\n===== Poison detection summary (raw vectors) =====")
+    for line in raw_metrics.format_summary("raw_vectors"):
+        print(line)
+    print("\n===== Poison detection summary (orthogonal projection) =====")
+    for line in proj_metrics.format_summary("orthogonal_projection"):
+        print(line)
+    if compression_spec is not None:
+        print("\n===== Poison detection summary (compressed raw vectors) =====")
+        for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+            print(line)
 
 
 if __name__ == "__main__":
@@ -583,35 +709,38 @@ if __name__ == "__main__":
     # 以下保持原默认示例参数，可按需扩展更多 CLI
     # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
     parser.add_argument("--num-rounds", type=int, default=30)#联邦轮次
-    parser.add_argument("--num-do", type=int, default=1)#在线DO数
-    parser.add_argument("--model-size", type=int, default=61706)  # cnn:61706 / lenet:81086 / resnet20:272474
+    parser.add_argument("--num-do", type=int, default=10)#在线DO数
+    parser.add_argument("--model-size", type=int, default=272474)  # cnn:61706 / lenet:81086 / resnet20:272474
+    parser.add_argument("--orthogonal-vector-count", type=int, default=1024)
     parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /lenet /resnet20
     parser.add_argument("--dataset-name", type=str, default="cifar10")#数据集名称：mnist /cifar10
     # DO 训练相关，batch size / max batches
     parser.add_argument("--train-batch-size", type=int, default=64)#训练batch size
     parser.add_argument("--train-max-batches", type=int, default=300)#训练最大batch数
-    parser.add_argument(
-        "--partition-mode",
-        type=str,
-        default="iid",
-        help="数据划分模式：iid / mild / extreme（控制各 DO 的本地数据是否 non-IID）",
-    )
+    parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 的本地数据是否 non-IID）")
     # 评估相关
     parser.add_argument("--eval-each-round", dest="eval_each_round", action="store_true", default=True, help="开启每轮明文评估（会额外耗时，默认开启）")
     #parser.add_argument("--no-eval-each-round", dest="eval_each_round", action="store_false", help="关闭每轮明文评估")暂时没用
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--eval-batches", type=int, default=50)
     #target攻击： label flip 相关参数 source_label:源标签 / target_label:目标标签 / attack_do_id:攻击 DO id / attack_rounds:攻击轮次 / poison_ratio:翻转比例：该 batch 的源类样本中随机抽 30% 改标签，其余不动
-    parser.add_argument("--attack-do-id",type=str,default="0,1",help="攻击 DO id（同时用于 label flip 和 untarget 投毒）如0,1；留空则不攻击（无需引号）",)
-    parser.add_argument("--source-label", type=int, default=1, help="若需监测 label flip，指定源标签，如2，代表把数据集中的2类数据投毒成3类数据")
-    parser.add_argument("--target-label", type=int, default=9, help="若需监测 label flip，指定目标标签，如3，代表把数据集中的2类数据投毒成3类数据") 
+    parser.add_argument("--attack-do-id",type=str,default="0,1",help="攻击 DO id（同时用于 label flip 和 untarget 投毒）如0,1；留空则不攻击（无需引号）")
+    parser.add_argument("--source-label", type=int, default=None, help="若需监测 label flip，指定源标签，如2，代表把数据集中的2类数据投毒成3类数据")
+    parser.add_argument("--target-label", type=int, default=None, help="若需监测 label flip，指定目标标签，如3，代表把数据集中的2类数据投毒成3类数据") 
     parser.add_argument("--attack-rounds", type=str, default="all", help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发")
     parser.add_argument("--poison-ratio", type=float, default=1.0, help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）")
     # untarget 梯度/参数投毒配置（与 label flip 解耦；留空则完全不启用 untarget）
-    parser.add_argument("--attack-type",type=str,default=None,help="untarget 梯度/参数投毒类型：stealth/random/signflip/lie_stat；留空则不启用",)
-    parser.add_argument("--attack-round-untarget",type=str,default=None,help="untarget 梯度/参数投毒触发轮次：单个数字、逗号列表或 all；留空则不触发",)
+    parser.add_argument("--attack-type",type=str,default=None,help="untarget 梯度/参数投毒类型：stealth/random/signflip/lie_stat；留空则不启用")
+    parser.add_argument("--attack-round-untarget",type=str,default=None,help="untarget 梯度/参数投毒触发轮次：单个数字、逗号列表或 all；留空则不触发")
     parser.add_argument("--attack-lambda", type=float, default=0.2, help="untarget 投毒放大系数（stealth/signflip/lie_stat 使用）")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="untarget random 投毒的标准差")
+    # backdoor (BadNets-style) config
+    parser.add_argument("--bd-enable", type=lambda x: str(x).lower() == "true", default=True, help="Enable backdoor (BadNets) when set to True, e.g. --bd-enable True")
+    parser.add_argument("--bd-target-label", type=int, default=9, help="Backdoor target label")
+    parser.add_argument("--bd-ratio", type=float, default=0.3, help="Backdoor injection ratio in source class")
+    parser.add_argument("--bd-trigger-size", type=int, default=2, help="Backdoor trigger size (pixels)")
+    parser.add_argument("--bd-trigger-value", type=float, default=3.0, help="Backdoor trigger value (pre-normalization)")
+    parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="Enable compressed vector detection (ResNet20 only)")
     args = parser.parse_args()
 
     attack_rounds = None
@@ -647,7 +776,7 @@ if __name__ == "__main__":
         num_rounds=args.num_rounds,
         num_do=args.num_do,
         model_size=args.model_size,
-        orthogonal_vector_count=2048,
+        orthogonal_vector_count=args.orthogonal_vector_count,
         bit_length=512,
         precision=10 ** 6,
         model_name=args.model_name,
@@ -670,4 +799,10 @@ if __name__ == "__main__":
         attack_rounds_untarget=attack_rounds_untarget,
         attack_lambda=args.attack_lambda,
         attack_sigma=args.attack_sigma,
+        bd_enable=args.bd_enable,
+        bd_target_label=args.bd_target_label,
+        bd_ratio=args.bd_ratio,
+        bd_trigger_size=args.bd_trigger_size,
+        bd_trigger_value=args.bd_trigger_value,
+        enable_compressed_detect=args.enable_compressed_detect,
     )
