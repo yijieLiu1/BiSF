@@ -27,9 +27,9 @@ class SafeInnerProduct:
     def round1_setup_and_encrypt(
         self,
         a_vectors: List[List[float]],
-        k1: int = 1024,
-        k2: int = 128,
-        k3: int = 64
+        k1: int = 512,
+        k2: int = 64,
+        k3: int = 32
     ) -> Tuple[int, int, List[List[int]], int, int]:
         """
         PA generates parameters and encrypts its vector group.

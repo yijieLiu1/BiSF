@@ -910,7 +910,7 @@ class DO:
         self._check_torch_available()
         dataset_name = self.dataset_name
         model_name = self.model_name
-        print(f"[DO {self.id}] 开始CNN本地训练，模型大小: {self.model_size}维，数据集 {dataset_name}，模型 {model_name}")
+        print(f"[DO {self.id}] 开始本地训练，模型大小: {self.model_size}维，数据集 {dataset_name}，模型 {model_name}")
 
         # 使用全局参数哈希作为随机种子，确保每轮初始化与全局状态关联
         seed_source = int(hashlib.sha256(str(global_params).encode('utf-8')).hexdigest(), 16)

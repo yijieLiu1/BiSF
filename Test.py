@@ -349,7 +349,7 @@ def run_federated_simulation(
         # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
         if eval_each_round:
             try:
-                train_loss, train_acc, _, train_asr, train_src_acc = ModelTest.evaluate_params(
+                train_loss, train_acc, _, train_asr, train_src_acc, _ = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -361,7 +361,7 @@ def run_federated_simulation(
                     source_label=source_label,
                     target_label=target_label,
                 )
-                val_loss, val_acc, _, val_asr, val_src_acc = ModelTest.evaluate_params(
+                val_loss, val_acc, _, val_asr, val_src_acc, _ = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -405,7 +405,7 @@ def run_federated_simulation(
         # 明文评估（可选，与 Train 同步）：每轮 train/val 指标，支持 BN 校准
         if eval_each_round:
             try:
-                train_loss, train_acc, _, train_asr, train_src_acc = ModelTest.evaluate_params(
+                train_loss, train_acc, _, train_asr, train_src_acc, train_bd_asr = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -417,7 +417,7 @@ def run_federated_simulation(
                     source_label=source_label,
                     target_label=target_label,
                 )
-                val_loss, val_acc, _, val_asr, val_src_acc = ModelTest.evaluate_params(
+                val_loss, val_acc, _, val_asr, val_src_acc, val_bd_asr = ModelTest.evaluate_params(
                     updated_params,
                     model_name=model_name,
                     dataset_name=dataset_name,
@@ -437,15 +437,21 @@ def run_federated_simulation(
                     "val_acc": val_acc,
                     "train_asr": train_asr,
                     "train_src_acc": train_src_acc,
+                    "train_bd_asr": train_bd_asr,
                     "val_asr": val_asr,
                     "val_src_acc": val_src_acc,
+                    "val_bd_asr": val_bd_asr,
                 })
                 extra_train = ""
                 extra_val = ""
                 if train_asr is not None and train_src_acc is not None:
                     extra_train = f", ASR(s->{target_label})={train_asr*100:.2f}%, src_acc={train_src_acc*100:.2f}%"
+                if train_bd_asr is not None:
+                    extra_train += f", bd_ASR={train_bd_asr*100:.2f}%"
                 if val_asr is not None and val_src_acc is not None:
                     extra_val = f", ASR(s->{target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
+                if val_bd_asr is not None:
+                    extra_val += f", bd_ASR={val_bd_asr*100:.2f}%"
                 print(f"[Eval][Round {round_idx}] Train loss={train_loss:.4f}, acc={train_acc*100:.2f}%{extra_train} | Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%{extra_val}")
                 metric = val_acc if not math.isnan(val_acc) else train_acc
                 if metric > best_metric:
@@ -466,7 +472,7 @@ def run_federated_simulation(
     # 可选：最终明文推理评估（与 Train 同步：支持 BN 校准）
     if eval_each_round:
         try:
-            val_loss, val_acc, _, val_asr, val_src_acc = ModelTest.evaluate_params(
+            val_loss, val_acc, _, val_asr, val_src_acc, val_bd_asr = ModelTest.evaluate_params(
                 csp.global_params,
                 model_name=model_name,
                 dataset_name=dataset_name,
@@ -481,6 +487,8 @@ def run_federated_simulation(
             extra_val = ""
             if val_asr is not None and val_src_acc is not None:
                 extra_val = f", ASR(s->{target_label})={val_asr*100:.2f}%, src_acc={val_src_acc*100:.2f}%"
+            if val_bd_asr is not None:
+                extra_val += f", bd_ASR={val_bd_asr*100:.2f}%"
             print(f"[Final Eval] Val loss={val_loss:.4f}, acc={val_acc*100:.2f}%{extra_val}")
         except Exception as e:
             print(f"[Final Eval] 评估失败: {e}")
@@ -576,7 +584,7 @@ if __name__ == "__main__":
     # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
     parser.add_argument("--num-rounds", type=int, default=30)#联邦轮次
     parser.add_argument("--num-do", type=int, default=1)#在线DO数
-    parser.add_argument("--model-size", type=int, default=272186)  # cnn:61706 / lenet:81086 / resnet20:272186
+    parser.add_argument("--model-size", type=int, default=61706)  # cnn:61706 / lenet:81086 / resnet20:272474
     parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /lenet /resnet20
     parser.add_argument("--dataset-name", type=str, default="cifar10")#数据集名称：mnist /cifar10
     # DO 训练相关，batch size / max batches
@@ -598,7 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--source-label", type=int, default=1, help="若需监测 label flip，指定源标签，如2，代表把数据集中的2类数据投毒成3类数据")
     parser.add_argument("--target-label", type=int, default=9, help="若需监测 label flip，指定目标标签，如3，代表把数据集中的2类数据投毒成3类数据") 
     parser.add_argument("--attack-rounds", type=str, default="all", help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发")
-    parser.add_argument("--poison-ratio", type=float, default=0.6, help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）")
+    parser.add_argument("--poison-ratio", type=float, default=1.0, help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）")
     # untarget 梯度/参数投毒配置（与 label flip 解耦；留空则完全不启用 untarget）
     parser.add_argument("--attack-type",type=str,default=None,help="untarget 梯度/参数投毒类型：stealth/random/signflip/lie_stat；留空则不启用",)
     parser.add_argument("--attack-round-untarget",type=str,default=None,help="untarget 梯度/参数投毒触发轮次：单个数字、逗号列表或 all；留空则不触发",)
@@ -639,7 +647,7 @@ if __name__ == "__main__":
         num_rounds=args.num_rounds,
         num_do=args.num_do,
         model_size=args.model_size,
-        orthogonal_vector_count=2_048,
+        orthogonal_vector_count=2048,
         bit_length=512,
         precision=10 ** 6,
         model_name=args.model_name,
