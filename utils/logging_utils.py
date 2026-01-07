@@ -85,6 +85,7 @@ def write_test_log(
     detection_logs_comp_raw: Optional[Sequence[Dict[str, str]]] = None,
     detection_logs_comp_proj: Optional[Sequence[Dict[str, str]]] = None,
     detection_summary_lines: Optional[Sequence[str]] = None,
+    timing_details: Optional[Sequence[Dict[str, object]]] = None,
 ) -> None:
     """Write Test.py style log file."""
     with open(log_path, "w", encoding="utf-8") as f:
@@ -136,6 +137,21 @@ def write_test_log(
                     f"cos(prev)={stat['cos']:.6f}, 均值={stat['mean']:.6f}, |max|={stat['abs_max']:.6f}, "
                     f"proxy_loss={stat['proxy_loss']:.6e}\n"
                 )
+        if timing_details:
+            f.write("\n逐轮用时明细:\n")
+            for item in timing_details:
+                f.write(f"Round {item.get('round')}:\n")
+                f.write(f"  round_total={item.get('round_total', 0.0):.4f}s\n")
+                f.write(f"  csp_safe_mul_prepare={item.get('csp_safe_mul_prepare', 0.0):.4f}s\n")
+                enc_map = item.get("do_encrypt_times", {}) or {}
+                for do_id, t_val in enc_map.items():
+                    f.write(f"  do{do_id}_encrypt={t_val:.4f}s\n")
+                r2_map = item.get("do_safe_mul_round2_times", {}) or {}
+                for do_id, t_val in r2_map.items():
+                    f.write(f"  do{do_id}_safe_mul_round2={t_val:.4f}s\n")
+                fin_map = item.get("csp_safe_mul_finalize_times", {}) or {}
+                for do_id, t_val in fin_map.items():
+                    f.write(f"  csp_safe_mul_finalize_do{do_id}={t_val:.4f}s\n")
         if detection_summary_lines:
             f.write("\n")
             for line in detection_summary_lines:

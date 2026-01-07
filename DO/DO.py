@@ -1085,6 +1085,29 @@ class DO:
             return []
         return list(self.training_history[-1].get('local_updates', []))
 
+    def _sample_safe_mul_noise(self, p: int, alpha: int) -> float:
+        """
+        Sample r for SafeMul while avoiding modular wrap-around.
+        Args:
+            p: SafeMul prime
+            alpha: SafeMul alpha
+        Returns:
+            r as float
+        """
+        denom = 2 * (self.precision ** 2) * (alpha ** 2)
+        if denom <= 0:
+            return 0.0
+        r_max = (p // denom) - 1
+        if r_max <= 0:
+            return 0.0
+        # Keep r small to avoid float precision loss in SafeMul scaling.
+        r_cap = 10 ** 6
+        r_max = min(r_max, r_cap)
+        if r_max <= 0:
+            return 0.0
+        rnd = random.SystemRandom()
+        return float(rnd.randrange(1, r_max + 1))
+
     def safe_mul_round2_process(self, payload: Dict[str, Any], b_vector: List[float]) -> Dict[str, Any]:
         """
         执行安全点积协议第2轮：
@@ -1098,7 +1121,11 @@ class DO:
         C_all = payload['C_all']
 
         # Round2: 计算 D_sums
-        D_sums = sip.round2_client_process(b_vector, C_all, alpha, p)
+        r = self._sample_safe_mul_noise(p, alpha)
+        b_vector_ext = list(b_vector) + [r]
+        print(f"[DO {self.id}] SafeMul Round2: 采样噪声 r = {r}")
+        print(f"[DO {self.id}] SafeMul Round2: 扩展向量 b_vector_ext 长度 = {len(b_vector_ext)}")
+        D_sums = sip.round2_client_process(b_vector_ext, C_all, alpha, p)
 
         # 本地 DO 部分的明文点积
         do_part: List[float] = []
@@ -1106,7 +1133,7 @@ class DO:
             s = 0.0
             for x, y in zip(b_vector, vec):
                 s += x * y
-            do_part.append(s)
+            do_part.append(s - r)
 
         return {'D_sums': D_sums, 'do_part': do_part}
 

@@ -135,6 +135,7 @@ def run_federated_simulation(
     bd_trigger_size: int = 2,
     bd_trigger_value: float = 3.0,
     enable_compressed_detect: bool = True,
+    refresh_orthogonal_each_round: bool = True,
 ) -> None:
     """
     运行一次联邦学习流程。
@@ -291,6 +292,7 @@ def run_federated_simulation(
         }
 
     round_times = []
+    round_timing_details: List[Dict[str, object]] = []
     eval_history: List[Dict[str, float]] = []
     detection_logs_raw: List[Dict[str, str]] = []
     detection_logs_proj: List[Dict[str, str]] = []
@@ -381,7 +383,7 @@ def run_federated_simulation(
         return poisoned
 
     for round_idx in range(1, num_rounds + 1):
-        if round_idx > 1:
+        if refresh_orthogonal_each_round and round_idx > 1:
             try:
                 ta.update_keys_for_new_round()
             except Exception as e:
@@ -389,6 +391,15 @@ def run_federated_simulation(
         round_start = time.time()
         print(f"\n===== Round {round_idx}: 广播参数 =====")
         global_params = csp.broadcast_params()
+
+        round_timing = {
+            "round": round_idx,
+            "round_total": 0.0,
+            "do_encrypt_times": {},
+            "do_safe_mul_round2_times": {},
+            "csp_safe_mul_prepare": 0.0,
+            "csp_safe_mul_finalize_times": {},
+        }
 
         # 掉线处理
         working_do_list: List[Optional[DO]] = list(do_list)
@@ -404,9 +415,15 @@ def run_federated_simulation(
         do_cipher_map: Dict[int, List[int]] = {}
         clean_update_map: Dict[int, List[float]] = {}
         for do in [d for d in working_do_list if d is not None]:
+            t_enc_start = time.time()
             ciphertexts = do.train_and_encrypt(global_params)
+            t_enc_end = time.time()
             do_cipher_map[do.id] = ciphertexts
             clean_update_map[do.id] = do.get_last_updates()
+            enc_time = getattr(do, "last_encrypt_time", None)
+            if enc_time is None:
+                enc_time = t_enc_end - t_enc_start
+            round_timing["do_encrypt_times"][do.id] = enc_time
 
         for attacker_id in [d.id for d in working_do_list if d is not None and d.id in attack_do_ids]:
             if attacker_id not in clean_update_map or not _should_poison_round(round_idx, attacker_id):
@@ -476,6 +493,7 @@ def run_federated_simulation(
         r1t=time.time()
         ctx = csp.safe_mul_prepare_payload()
         r1te=time.time()
+        round_timing["csp_safe_mul_prepare"] = r1te - r1t
         print(f"[Round {round_idx}] SafeMul 准备阶段耗时 {r1te - r1t:.4f}s")
         for do in [d for d in working_do_list if d is not None]:
             b_vec = do.get_last_updates()
@@ -483,10 +501,12 @@ def run_federated_simulation(
             r2t=time.time()
             resp = do.safe_mul_round2_process(payload, b_vec)
             r2te=time.time()
+            round_timing["do_safe_mul_round2_times"][do.id] = r2te - r2t
             print(f"[Round {round_idx}] DO {do.id} SafeMul 第二轮处理耗时 {r2te - r2t:.4f}s")
 
             projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'], do.id)
             r3t=time.time()
+            round_timing["csp_safe_mul_finalize_times"][do.id] = r3t - r2te
             print(f"[Round {round_idx}] CSP SafeMul 最终化 DO {do.id} 投影耗时 {r3t - r2te:.4f}s")
             print(f" DO {do.id} 投影向量(长度{len(projection)})")
         t2 = time.time()
@@ -590,6 +610,8 @@ def run_federated_simulation(
                 print(f"[Eval][Round {round_idx}] 评估失败: {e}")
         round_elapsed = time.time() - round_start
         round_times.append(round_elapsed)
+        round_timing["round_total"] = round_elapsed
+        round_timing_details.append(round_timing)
         print(f"[Round {round_idx}] 用时 {round_elapsed:.2f}s")
     total_elapsed = time.time() - total_start
     print("\n===== 全部轮次结束 =====")
@@ -685,6 +707,7 @@ def run_federated_simulation(
             detection_logs_comp_raw=detection_logs_comp_raw if compression_spec is not None else None,
             detection_logs_comp_proj=None,
             detection_summary_lines=summary_lines,
+            timing_details=round_timing_details,
         )
         print(f"Log saved: {log_path}")
     except Exception as e:
@@ -708,12 +731,13 @@ if __name__ == "__main__":
     parser.add_argument("--bn-calib-batches", type=int, default=30, help="评估时 BN 校准用的训练批次数（仅 ResNet 有效）")
     # 以下保持原默认示例参数，可按需扩展更多 CLI
     # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
-    parser.add_argument("--num-rounds", type=int, default=30)#联邦轮次
-    parser.add_argument("--num-do", type=int, default=10)#在线DO数
-    parser.add_argument("--model-size", type=int, default=272474)  # cnn:61706 / lenet:81086 / resnet20:272474
+    parser.add_argument("--num-rounds", type=int, default=15)#联邦轮次
+    parser.add_argument("--num-do", type=int, default=3)#在线DO数
+    parser.add_argument("--model-size", type=int, default=61706)  # cnn:61706 / lenet:81086 / resnet20:272474
     parser.add_argument("--orthogonal-vector-count", type=int, default=1024)
-    parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /lenet /resnet20
-    parser.add_argument("--dataset-name", type=str, default="cifar10")#数据集名称：mnist /cifar10
+    parser.add_argument("--refresh-orthogonal-each-round", type=lambda x: str(x).lower() == "true", default=False, help="是否每轮刷新 TA 正交向量组（True/False）")
+    parser.add_argument("--model-name", type=str, default="cnn")    #模型名称：cnn /lenet /resnet20
+    parser.add_argument("--dataset-name", type=str, default="mnist")#数据集名称：mnist /cifar10
     # DO 训练相关，batch size / max batches
     parser.add_argument("--train-batch-size", type=int, default=64)#训练batch size
     parser.add_argument("--train-max-batches", type=int, default=300)#训练最大batch数
@@ -805,4 +829,5 @@ if __name__ == "__main__":
         bd_trigger_size=args.bd_trigger_size,
         bd_trigger_value=args.bd_trigger_value,
         enable_compressed_detect=args.enable_compressed_detect,
+        refresh_orthogonal_each_round=args.refresh_orthogonal_each_round,
     )

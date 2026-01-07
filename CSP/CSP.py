@@ -876,16 +876,28 @@ class CSP:
     def safe_mul_prepare_payload(self) -> Dict[str, object]:
         """准备安全点积第1轮数据，基于 CSP 的正交向量组发送 (p, alpha, C_all)。"""
         sip = SafeInnerProduct(precision_factor=self.precision)
-        p, alpha, C_all, s, s_inv = sip.round1_setup_and_encrypt(self.orthogonal_vectors_for_csp)
+        # Extend vectors by one dim; CSP side uses trailing 1 to carry DO noise r.
+        print("setup safe mul with orthogonal vectors count:", len(self.orthogonal_vectors_for_csp))
+        extended_vectors = [list(vec) + [1.0] for vec in self.orthogonal_vectors_for_csp]
+        print("extended vector dimension:", len(extended_vectors[0]))
+        p, alpha, C_all, s, s_inv = sip.round1_setup_and_encrypt(extended_vectors)
         return {'p': p, 'alpha': alpha, 'C_all': C_all, 's_inv': s_inv}
 
     def safe_mul_finalize(self, ctx: Dict[str, object], D_sums: List[int], do_part: List[float], do_id: int) -> List[float]:
-        """执行安全点积第3轮并与 DO 明文部分求和，得到 w·U 的 1×m 向量，并缓存该 DO 的映射结果。"""
+        """
+        执行安全点积第3轮并与 DO 明文部分求和，得到 w·U 的 1×m 向量，并缓存该 DO 的映射结果。
+        
+        关键设计：DO已通过两个返回值(D_sums和do_part)实现掩码化机制：
+        - D_sums decrypts to csp_part that includes +r per projection.
+        - do_part already subtracts r per projection on DO side.
+        - Adding them cancels r; CSP never sees r directly.
+        """
         sip = SafeInnerProduct(precision_factor=self.precision)
         p = ctx['p']
         alpha = ctx['alpha']
         s_inv = ctx['s_inv']
         csp_part = sip.round3_decrypt(D_sums, s_inv, alpha, p)
+        # 直接相加，扰动自动消去
         projection = [csp_part[i] + do_part[i] for i in range(len(csp_part))]
         self.do_projection_map[do_id] = projection
         return projection
