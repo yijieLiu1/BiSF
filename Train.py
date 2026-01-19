@@ -145,10 +145,42 @@ def _compress_vector(vec: List[float], spec: Dict[str, object]) -> List[float]:
     return out
 
 
+def _generate_orthogonal_vectors(dim: int, count: int, seed: int = 2025) -> List[List[float]]:
+    """生成 dim×count 的正交向量组（列正交），用于压缩向量的投影检测。"""
+    if dim <= 0 or count <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    A = rng.standard_normal(size=(dim, count))
+    Q, _ = np.linalg.qr(A, mode="reduced")
+    return [Q[:, i].astype(float).tolist() for i in range(Q.shape[1])]
+
+
+def _project_vector_chunked(
+    vec: List[float],
+    orthogonal_vectors: List[List[float]],
+    block_size: int,
+) -> List[float]:
+    """Stream orthogonal projection in blocks to reduce peak memory."""
+    total = len(orthogonal_vectors)
+    if total == 0:
+        return []
+    if block_size <= 0 or block_size >= total:
+        block_size = total
+    projection: List[float] = []
+    for start in range(0, total, block_size):
+        block = orthogonal_vectors[start:start + block_size]
+        for u_vec in block:
+            s = 0.0
+            for x, y in zip(vec, u_vec):
+                s += x * y
+            projection.append(s)
+    return projection
+
+
 def main() -> None:
     #MNIST训练集按照batchsize=128时，大约切成468个batch，每个DO取400个batch进行训练，相当于差不多一次一个DO跑一个epoch
     parser = argparse.ArgumentParser(description="DO 明文训练（支持投毒），输出全局参数")
-    parser.add_argument("--rounds", type=int, default=20, help="训练轮数")
+    parser.add_argument("--rounds", type=int, default=150, help="训练轮数")
     parser.add_argument("--num-do", type=int, default=10, help="DO 数量")
     parser.add_argument("--model-name", type=str, default="resnet20", help="模型名称（cnn/lenet/resnet20，对应 LeNet-5 或 ResNet20）")
     parser.add_argument("--dataset-name", type=str, default="cifar10", help="数据集名称（mnist/cifar10）")
@@ -156,9 +188,9 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=300, help="每轮使用的批次数上限")
     parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 训练数据的 IID/non-IID 程度）",)
     # target label flip 投毒设置（与 Test.py 对齐）
-    parser.add_argument("--poison-do-id",type=str,default="1,3,5",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
-    parser.add_argument("--source-label", type=int, default=None, help="若需 label flip，指定源标签")
-    parser.add_argument("--target-label", type=int, default=None, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
+    parser.add_argument("--poison-do-id",type=str,default="1,2,4,7",help="攻击 DO id（同时用于 label flip 和 untarget 投毒），逗号分隔如 0,1；留空则不投毒",)
+    parser.add_argument("--source-label", type=int, default=1, help="若需 label flip，指定源标签")
+    parser.add_argument("--target-label", type=int, default=99, help="若需 label flip，指定目标标签，超出数据label范围，则直接随机选择")
     parser.add_argument("--attack-rounds",type=str,default="all",help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发",)
     parser.add_argument("--poison-ratio",type=float,default=1.0,help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）",)
     # 梯度投毒设置（stealth/random/signflip/lie_stat）
@@ -167,7 +199,7 @@ def main() -> None:
     parser.add_argument("--attack-lambda", type=float, default=0.25, help="投毒放大系数")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="随机投毒的标准差")
     # backdoor (BadNets-style) 配置
-    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=True,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
+    parser.add_argument("--bd-enable",type=lambda x: str(x).lower() == "true",default=False,help="启用 backdoor (BadNets) 投毒，显式传 True 才会开启，如 --bd-enable True",)
     parser.add_argument("--bd-target-label", type=int, default=9, help="backdoor 目标标签")
     parser.add_argument("--bd-ratio", type=float, default=0.3, help="backdoor 在源标签样本中的注入比例")
     parser.add_argument("--bd-trigger-size", type=int, default=2, help="触发器方块尺寸（像素）")
@@ -180,7 +212,11 @@ def main() -> None:
     parser.add_argument("--eval-batches", type=int, default=50, help="每轮评估使用的批次数上限（train/val）")
     parser.add_argument("--bn-calib-batches", type=int, default=30, help="BN 校准用的训练批次数（仅 resnet 有效）")
     parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="是否启用压缩向量投毒检测（仅 ResNet20 有效）")
+    parser.add_argument("--proj-block-size", type=int, default=512, help="正交投影分块大小，默认 256，<=0 表示不分块")
+    parser.add_argument("--refresh-orthogonal-each-round", type=lambda x: str(x).lower() == "true", default=False, help="是否每轮刷新 TA 正交向量组（True/False）")
+    parser.add_argument("--enable-all-detection", type=lambda x: str(x).lower() == "true", default=True, help="是否开启全部投毒检测（True/False）")
     args = parser.parse_args()
+    enable_all_detection = bool(args.enable_all_detection)
 
     # 解析 target label flip 轮次
     attack_rounds = None
@@ -213,12 +249,18 @@ def main() -> None:
     model_size = infer_model_size(args.model_name, args.dataset_name)
     print(f"[Train] 模型参数量估计: {model_size}")
     compression_spec = None
+    compressed_orthogonal_vectors: Optional[List[List[float]]] = None
     if args.enable_compressed_detect and args.model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
         compression_spec = _build_resnet20_compression_spec(args.dataset_name)
         print(
             f"[Train] 启用压缩检测：原始维度 {compression_spec['input_dim']} -> "
             f"{compression_spec['compressed_dim']}"
         )
+        if enable_all_detection:
+            comp_dim = int(compression_spec["compressed_dim"])
+            comp_k = min(1024, comp_dim)
+            if comp_k > 0:
+                compressed_orthogonal_vectors = _generate_orthogonal_vectors(comp_dim, comp_k)
     # 构建 TA：用于 DO 初始化与正交向量生成（与 Test.py 保持一致，使用 2048 维投影）
     ta = TA(num_do=args.num_do, model_size=model_size, orthogonal_vector_count=1024, bit_length=512)
 
@@ -275,12 +317,14 @@ def main() -> None:
     detection_logs_raw: List[Dict[str, str]] = []
     detection_logs_proj: List[Dict[str, str]] = []
     detection_logs_comp_raw: List[Dict[str, str]] = []
+    detection_logs_comp_proj: List[Dict[str, str]] = []
     best_params = None
     best_val_acc = -1.0
     detection_methods = ("multi_krum", "geomedian", "clustering")
     raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     comp_raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
+    comp_proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
 
 
     def _run_detection_suite(vector_map: Dict[int, List[float]], label: str, temporary: bool = True) -> Dict[str, object]:
@@ -374,7 +418,7 @@ def main() -> None:
         round_start = time.time()
         print(f"\n----- Round {r}/{args.rounds} -----")
         # 与 Test.py 保持一致：从第 2 轮开始，每轮刷新 TA 的密钥与正交向量组
-        if r > 1:
+        if args.refresh_orthogonal_each_round and r > 1:
             try:
                 ta.update_keys_for_new_round()
             except Exception as e:
@@ -393,53 +437,68 @@ def main() -> None:
         active_ids = list(updates.keys())
         poisoned_ids = _get_poisoned_ids(r, active_ids)
 
-        # Poison detection (raw vectors, Plain)
-        det_raw = _run_detection_suite(updates, "raw_vectors")
-        detection_logs_raw.append({"round": r, "log": det_raw["log"]})
-        raw_suspects = det_raw.get("suspects", {})
-        for method in detection_methods:
-            raw_metrics.update(
-                method, r, raw_suspects.get(method), poisoned_ids, active_ids
-            )
+        # Poison detection (raw/compressed/projection, Plain)
         compressed_updates = None
-        if compression_spec is not None:
-            compressed_updates = {do_id: _compress_vector(vec, compression_spec) for do_id, vec in updates.items()}
-            det_comp_raw = _run_detection_suite(compressed_updates, "compressed_raw_vectors")
-            detection_logs_comp_raw.append({"round": r, "log": det_comp_raw["log"]})
-            comp_raw_suspects = det_comp_raw.get("suspects", {})
+        if enable_all_detection:
+            det_raw = _run_detection_suite(updates, "raw_vectors")
+            detection_logs_raw.append({"round": r, "log": det_raw["log"]})
+            raw_suspects = det_raw.get("suspects", {})
             for method in detection_methods:
-                comp_raw_metrics.update(
-                    method, r, comp_raw_suspects.get(method), poisoned_ids, active_ids
+                raw_metrics.update(
+                    method, r, raw_suspects.get(method), poisoned_ids, active_ids
                 )
+            if compression_spec is not None:
+                compressed_updates = {do_id: _compress_vector(vec, compression_spec) for do_id, vec in updates.items()}
+                det_comp_raw = _run_detection_suite(compressed_updates, "compressed_raw_vectors")
+                detection_logs_comp_raw.append({"round": r, "log": det_comp_raw["log"]})
+                comp_raw_suspects = det_comp_raw.get("suspects", {})
+                for method in detection_methods:
+                    comp_raw_metrics.update(
+                        method, r, comp_raw_suspects.get(method), poisoned_ids, active_ids
+                    )
+                if compressed_orthogonal_vectors:
+                    comp_proj_map: Dict[int, List[float]] = {}
+                    for do_id, vec in compressed_updates.items():
+                        proj: List[float] = []
+                        for u_vec in compressed_orthogonal_vectors:
+                            s = 0.0
+                            for x, y in zip(vec, u_vec):
+                                s += x * y
+                            proj.append(s)
+                        comp_proj_map[do_id] = proj
+                    det_comp_proj = _run_detection_suite(comp_proj_map, "compressed_projection")
+                    detection_logs_comp_proj.append({"round": r, "log": det_comp_proj["log"]})
+                    comp_proj_suspects = det_comp_proj.get("suspects", {})
+                    comp_active_ids = list(comp_proj_map.keys())
+                    for method in detection_methods:
+                        comp_proj_metrics.update(
+                            method, r, comp_proj_suspects.get(method), poisoned_ids, comp_active_ids
+                        )
 
-        # 使用 TA 生成的完整正交向量组 U（形状约为 2048×model_size），直接做明文点积 w·U 得到 2048 维投影
-        print(f"\n===== Round {r}: 正交投影计算（Plain，在线 DO）=====")
-        t1 = time.time()
-        proj_map: Dict[int, List[float]] = {}
-        U = ta.get_orthogonal_vectors()  # List[List[float]]，形状: [orthogonal_count][model_size]
-        if U:
-            for do_id, vec in updates.items():
-                # 1×d 向量与 k×d 正交向量组逐个点积，得到长度为 k=2048 的投影向量
-                proj: List[float] = []
-                for u_vec in U:
-                    s = 0.0
-                    for x, y in zip(vec, u_vec):
-                        s += x * y
-                    proj.append(s)
-                proj_map[do_id] = proj
-                print(f" DO {do_id} 投影向量(长度{len(proj)})")
-            # 更新 detector 的投影映射并执行检测
-            csp_detector.do_projection_map = proj_map
-            det_proj = _run_detection_suite(proj_map, "orthogonal_projection", temporary=False)
-            detection_logs_proj.append({"round": r, "log": det_proj["log"]})
-            proj_active_ids = list(proj_map.keys())
-            proj_suspects = det_proj.get("suspects", {})
-            for method in detection_methods:
-                proj_metrics.update(
-                    method, r, proj_suspects.get(method), poisoned_ids, proj_active_ids
-                )
-        t2 = time.time()
-        print(f"[Train][Round {r}] 正交投影耗时 {t2 - t1:.4f}s")
+        if enable_all_detection:
+            # 使用 TA 生成的完整正交向量组 U（形状约为 2048×model_size），直接做明文点积 w·U 得到 2048 维投影
+            print(f"\n===== Round {r}: 正交投影计算（Plain，在线 DO）=====")
+            t1 = time.time()
+            proj_map: Dict[int, List[float]] = {}
+            U = ta.get_orthogonal_vectors()  # List[List[float]]，形状: [orthogonal_count][model_size]
+            if  U:
+                for do_id, vec in updates.items():
+                    # 1×d 向量与 k×d 正交向量组逐个点积，按分块流式处理
+                    proj = _project_vector_chunked(vec, U, args.proj_block_size)
+                    proj_map[do_id] = proj
+                    print(f" DO {do_id} 投影向量(长度{len(proj)})")
+                # 更新 detector 的投影映射并执行检测
+                csp_detector.do_projection_map = proj_map
+                det_proj = _run_detection_suite(proj_map, "orthogonal_projection", temporary=False)
+                detection_logs_proj.append({"round": r, "log": det_proj["log"]})
+                proj_active_ids = list(proj_map.keys())
+                proj_suspects = det_proj.get("suspects", {})
+                for method in detection_methods:
+                    proj_metrics.update(
+                        method, r, proj_suspects.get(method), poisoned_ids, proj_active_ids
+                    )
+            t2 = time.time()
+            print(f"[Train][Round {r}] 正交投影耗时 {t2 - t1:.4f}s")
 
         # 简单平均
         agg = [0.0] * model_size
@@ -591,10 +650,12 @@ def main() -> None:
         print(f"[Train] 最优参数已保存: {best_path}")
     # 保存日志（收敛、评估、用时）
     summary_lines = []
-    summary_lines.extend(raw_metrics.format_summary("raw_vectors"))
-    summary_lines.extend(proj_metrics.format_summary("orthogonal_projection"))
-    if compression_spec is not None:
-        summary_lines.extend(comp_raw_metrics.format_summary("compressed_raw_vectors"))
+    if enable_all_detection:
+        summary_lines.extend(raw_metrics.format_summary("raw_vectors"))
+        summary_lines.extend(proj_metrics.format_summary("orthogonal_projection"))
+        if compression_spec is not None:
+            summary_lines.extend(comp_raw_metrics.format_summary("compressed_raw_vectors"))
+            summary_lines.extend(comp_proj_metrics.format_summary("compressed_projection"))
     write_train_log(
         log_path=str(log_path),
         total_elapsed=total_elapsed,
@@ -602,11 +663,11 @@ def main() -> None:
         convergence_history=convergence_history,
         train_metric_history=train_metric_history,
         val_metric_history=val_metric_history,
-        detection_logs_raw=detection_logs_raw,
-        detection_logs_proj=detection_logs_proj,
-        detection_logs_comp_raw=detection_logs_comp_raw if compression_spec is not None else None,
-        detection_logs_comp_proj=None,
-        detection_summary_lines=summary_lines,
+        detection_logs_raw=detection_logs_raw if enable_all_detection else [],
+        detection_logs_proj=detection_logs_proj if enable_all_detection else [],
+        detection_logs_comp_raw=detection_logs_comp_raw if (enable_all_detection and compression_spec is not None) else None,
+        detection_logs_comp_proj=detection_logs_comp_proj if (enable_all_detection and compression_spec is not None) else None,
+        detection_summary_lines=summary_lines if enable_all_detection else None,
     )
     print(f"[Train] 日志已保存: {log_path}")
     print(f"[Train] 总用时: {total_elapsed:.2f}s")
@@ -628,16 +689,20 @@ def main() -> None:
                 if vm.get("bd_asr") is not None:
                     extra_val += f", bd_ASR={vm['bd_asr']*100:.2f}%"
                 print(f"Round {tm['round']}: Train loss={tm['loss']:.4f}, acc={tm['acc']*100:.2f}%{extra_train} | Val loss={vm['loss']:.4f}, acc={vm['acc']*100:.2f}%{extra_val}")
-        print("\n===== Poison detection summary (raw vectors) =====")
-        for line in raw_metrics.format_summary("raw_vectors"):
-            print(line)
-        print("\n===== Poison detection summary (orthogonal projection) =====")
-        for line in proj_metrics.format_summary("orthogonal_projection"):
-            print(line)
-        if compression_spec is not None:
-            print("\n===== Poison detection summary (compressed raw vectors) =====")
-            for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+        if enable_all_detection:
+            print("\n===== Poison detection summary (raw vectors) =====")
+            for line in raw_metrics.format_summary("raw_vectors"):
                 print(line)
+            print("\n===== Poison detection summary (orthogonal projection) =====")
+            for line in proj_metrics.format_summary("orthogonal_projection"):
+                print(line)
+            if compression_spec is not None:
+                print("\n===== Poison detection summary (compressed raw vectors) =====")
+                for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+                    print(line)
+                print("\n===== Poison detection summary (compressed projection) =====")
+                for line in comp_proj_metrics.format_summary("compressed_projection"):
+                    print(line)
 
 
 if __name__ == "__main__":

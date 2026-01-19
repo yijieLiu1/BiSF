@@ -18,6 +18,12 @@ class CSP:
 
     def __init__(self, ta, model_size: Optional[int] = None, precision: int = 10 ** 6, initial_params_path: Optional[str] = None):
         self.ta = ta
+        self.data_shares: List[float] = []
+        if hasattr(self.ta, "get_data_shares"):
+            try:
+                self.data_shares = self.ta.get_data_shares()
+            except Exception:
+                self.data_shares = []
         if model_size is None and hasattr(self.ta, "get_model_size"):
             try:
                 self.model_size = self.ta.get_model_size()
@@ -111,9 +117,9 @@ class CSP:
             
         # print(f"[CSP] 已同步Paillier公参，N={N}, g={self.impaillier.g}, h={self.impaillier.h}, y={self.impaillier.y}")
     # ============== 广播 ==============
-    def broadcast_params(self) -> List[float]:
-        # 第 1 轮沿用初始化时的密钥/正交向量；从第 2 轮开始每轮刷新
-        if self.round_count > 0:
+    def broadcast_params(self, refresh_orthogonal_each_round: bool = False) -> List[float]:
+        # 第 1 轮沿用初始化时的密钥/正交向量；从第 2 轮开始可选刷新
+        if refresh_orthogonal_each_round and self.round_count > 0:
             try:
                 self.ta.update_keys_for_new_round()
             except Exception as e:
@@ -204,9 +210,12 @@ class CSP:
 
     # ============== 解密流程（正常/带恢复） ==============
     def _decrypt_vector(self, aggregated: List[int]) -> List[float]:
+        time_start_decry = time.time()
         results: List[float] = [0.0] * self.model_size
         for i in range(self.model_size):
             results[i] = self.impaillier.decrypt(aggregated[i])
+        time_end_decry = time.time()
+        print(f"[CSP] 正常解密完成，用时{time_end_decry - time_start_decry:.4f}秒")
         print(f"[CSP] 正常解密结果维度: {len(results)}")
         print(f"[CSP] 解密结果前10维: {results[:10]}")
         return results
@@ -254,6 +263,7 @@ class CSP:
         params_hash = int.from_bytes(hashlib.sha256(params_bytes).digest(), 'big', signed=False)
 
         if not missing_ids:
+
             summed = self._decrypt_vector(aggregated)
         else:
             print(f"\n[CSP] 检测到掉线DO，进行密钥恢复\n")
@@ -276,10 +286,8 @@ class CSP:
         print(f"[CSP] 聚合结果前10维: {summed[:10]}")
         print(f"[CSP] 聚合结果范围: [{min(summed):.4f}, {max(summed):.4f}]")
 
-        num_online = max(1, len(online_dos))
-        # DO 侧上传的是训练后的完整参数（几万维），
-        # 因此这里直接取在线 DO 的平均作为新一轮全局参数。
-        next_params = [ (summed[i] / num_online) for i in range(self.model_size) ]
+        # DO 侧已按数据份额加权上传，这里直接使用求和结果作为新一轮全局参数。
+        next_params = list(summed)
 
         self.global_params = next_params
         print(f"[CSP] 更新后的全局参数维度: {len(next_params)}")
@@ -307,7 +315,12 @@ class CSP:
             print("[CSP] 警告：尚未记录 DO 的正交映射结果，跳过一致性对比。")
             return False
 
-        sum_wu = float(sum(sum(vec) for vec in self.do_projection_map.values()))
+        sum_wu = 0.0
+        for do_id, vec in self.do_projection_map.items():
+            share = 1.0
+            if self.data_shares and 0 <= do_id < len(self.data_shares):
+                share = float(self.data_shares[do_id])
+            sum_wu += share * float(sum(vec))
         sum_proj = self.compute_sum_with_orthogonal_vector(params)
         print(f"[CSP] w·U 向量求和结果: {sum_wu}")
         print(f"[CSP] 正交求和向量点积结果: {sum_proj}")
@@ -322,7 +335,10 @@ class CSP:
         for do_id in subset_ids:
             vec = self.do_projection_map.get(do_id)
             if vec:
-                total += float(sum(vec))
+                share = 1.0
+                if self.data_shares and 0 <= do_id < len(self.data_shares):
+                    share = float(self.data_shares[do_id])
+                total += share * float(sum(vec))
         return total
 
     def _decrypt_vector_quiet(self, cipher_vec: List[int]) -> List[float]:
@@ -882,6 +898,23 @@ class CSP:
         print("extended vector dimension:", len(extended_vectors[0]))
         p, alpha, C_all, s, s_inv = sip.round1_setup_and_encrypt(extended_vectors)
         return {'p': p, 'alpha': alpha, 'C_all': C_all, 's_inv': s_inv}
+
+    def safe_mul_prepare_payload_block(self, start: int, end: int) -> Dict[str, object]:
+        """准备分块 SafeMul 数据，仅处理 CSP 正交向量组的一段。"""
+        sip = SafeInnerProduct(precision_factor=self.precision)
+        vectors = self.orthogonal_vectors_for_csp[start:end]
+        extended_vectors = [list(vec) + [1.0] for vec in vectors]
+        p, alpha, C_all, s, s_inv = sip.round1_setup_and_encrypt(extended_vectors)
+        return {'p': p, 'alpha': alpha, 'C_all': C_all, 's_inv': s_inv}
+
+    def safe_mul_finalize_block(self, ctx: Dict[str, object], D_sums: List[int], do_part: List[float]) -> List[float]:
+        """执行分块 SafeMul 最终化，返回该块投影结果。"""
+        sip = SafeInnerProduct(precision_factor=self.precision)
+        p = ctx['p']
+        alpha = ctx['alpha']
+        s_inv = ctx['s_inv']
+        csp_part = sip.round3_decrypt(D_sums, s_inv, alpha, p)
+        return [csp_part[i] + do_part[i] for i in range(len(csp_part))]
 
     def safe_mul_finalize(self, ctx: Dict[str, object], D_sums: List[int], do_part: List[float], do_id: int) -> List[float]:
         """

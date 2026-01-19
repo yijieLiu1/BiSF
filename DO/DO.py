@@ -272,6 +272,59 @@ class DO:
         return shards
 
     @classmethod
+    def _compute_target_sizes(
+        cls,
+        total: int,
+        shares: Optional[List[float]],
+        num_do: int,
+    ) -> Optional[List[int]]:
+        if not shares or len(shares) != num_do or total <= 0:
+            return None
+        cleaned = [max(0.0, float(s)) for s in shares]
+        share_sum = sum(cleaned)
+        if share_sum <= 0.0:
+            return None
+        norm = [s / share_sum for s in cleaned]
+        raw_sizes = [total * s for s in norm]
+        sizes = [int(x) for x in raw_sizes]
+        remainder = total - sum(sizes)
+        if remainder != 0:
+            frac = [(raw_sizes[i] - sizes[i], i) for i in range(num_do)]
+            frac.sort(reverse=True)
+            step = 1 if remainder > 0 else -1
+            remain = abs(remainder)
+            idx = 0
+            while remain > 0 and num_do > 0:
+                _, i = frac[idx % num_do]
+                if step < 0 and sizes[i] == 0:
+                    idx += 1
+                    continue
+                sizes[i] += step
+                remain -= 1
+                idx += 1
+        return sizes
+
+    @classmethod
+    def _split_indices_by_sizes(
+        cls,
+        full_idx: List[int],
+        sizes: List[int],
+        seed: int = 2025,
+    ) -> List[List[int]]:
+        rnd = random.Random(seed)
+        idx = list(full_idx)
+        rnd.shuffle(idx)
+        shards: List[List[int]] = []
+        start = 0
+        for size in sizes:
+            end = start + max(0, int(size))
+            shards.append(idx[start:end])
+            start = end
+        if start < len(idx) and shards:
+            shards[-1].extend(idx[start:])
+        return shards
+
+    @classmethod
     def _build_shards_mild_non_iid(
         cls,
         full_idx: List[int],
@@ -279,6 +332,7 @@ class DO:
         num_do: int,
         num_classes: int,
         alpha: float = 0.75,
+        target_sizes: Optional[List[int]] = None,
         seed: int = 2025,
     ) -> List[List[int]]:
         """
@@ -298,7 +352,7 @@ class DO:
         shards: List[List[int]] = []
 
         for i in range(num_do):
-            target_size = base + (1 if i < rem else 0)
+            target_size = target_sizes[i] if target_sizes and i < len(target_sizes) else base + (1 if i < rem else 0)
             if target_size <= 0:
                 shards.append([])
                 continue
@@ -338,6 +392,7 @@ class DO:
         dataset,
         num_do: int,
         num_classes: int,
+        target_sizes: Optional[List[int]] = None,
         seed: int = 2025,
     ) -> List[List[int]]:
         """
@@ -366,7 +421,7 @@ class DO:
         shards: List[List[int]] = []
 
         for i in range(num_do):
-            target_size = base + (1 if i < rem else 0)
+            target_size = target_sizes[i] if target_sizes and i < len(target_sizes) else base + (1 if i < rem else 0)
             if target_size <= 0:
                 shards.append([])
                 continue
@@ -426,19 +481,35 @@ class DO:
         # 3) 按 DO 数量划分索引（IID / mild-non-IID / extreme-non-IID，带缓存）
         num_do = getattr(self.ta, "num_do", 1)
         mode = getattr(self, "partition_mode", "iid")
-        shard_cache_key = f"{name}_mode{mode}_n{num_do}_root{data_root}"
+        shares = None
+        if hasattr(self.ta, "get_data_shares"):
+            try:
+                shares = self.ta.get_data_shares()
+            except Exception:
+                shares = None
+        target_sizes = self._compute_target_sizes(len(full_idx), shares, num_do)
+        share_key = ""
+        if shares and target_sizes:
+            share_str = ",".join(f"{s:.6f}" for s in shares)
+            share_key = f"_share{hashlib.sha256(share_str.encode('utf-8')).hexdigest()[:8]}"
+        shard_cache_key = f"{name}_mode{mode}_n{num_do}{share_key}_root{data_root}"
         if shard_cache_key not in DO._sharded_indices_cache:
             num_classes = meta["num_classes"]
             if mode == "mild":
                 shards = DO._build_shards_mild_non_iid(
-                    full_idx, dataset, num_do=num_do, num_classes=num_classes, alpha=0.75, seed=2025
+                    full_idx, dataset, num_do=num_do, num_classes=num_classes, alpha=0.75,
+                    target_sizes=target_sizes, seed=2025
                 )
             elif mode == "extreme":
                 shards = DO._build_shards_extreme_non_iid(
-                    full_idx, dataset, num_do=num_do, num_classes=num_classes, seed=2025
+                    full_idx, dataset, num_do=num_do, num_classes=num_classes,
+                    target_sizes=target_sizes, seed=2025
                 )
             else:
-                shards = DO._build_shards_iid(full_idx, num_do=num_do, seed=2025)
+                if target_sizes:
+                    shards = DO._split_indices_by_sizes(full_idx, target_sizes, seed=2025)
+                else:
+                    shards = DO._build_shards_iid(full_idx, num_do=num_do, seed=2025)
             DO._sharded_indices_cache[shard_cache_key] = shards
 
         shards = DO._sharded_indices_cache[shard_cache_key]
@@ -1039,15 +1110,30 @@ class DO:
         # 同步最新一轮的正交向量（用于随后 SafeMul）
         self._load_orthogonal_vectors()
         
-        # 步骤2：本地训练
+        # 步骤2：本地训练（未加权）
         updates = self._local_train(global_params)
 
-        
+        # 按 TA 分配的数据份额加权上传
+        share = 1.0
+        if hasattr(self.ta, "get_data_share_for_do"):
+            try:
+                share = float(self.ta.get_data_share_for_do(self.id))
+            except Exception:
+                share = 1.0
+        if share <= 0.0:
+            share = 1.0
+        upload_updates = updates
+        if share != 1.0:
+            upload_updates = [share * v for v in updates]
+            if self.training_history:
+                self.training_history[-1]['uploaded_updates'] = list(upload_updates)
+            print(f"[DO {self.id}] 按数据份额加权上传: share={share:.3f}")
+
         print(f"DO开始执行模型参数加密...")
         time1=time.time()
         # 步骤3：使用派生私钥加密训练结果（加密的是完整参数而非增量）
         ciphertexts = []
-        for i, update in enumerate(updates):
+        for i, update in enumerate(upload_updates):
             ciphertext = self._encrypt_value(update)
             ciphertexts.append(ciphertext)
         
@@ -1130,6 +1216,28 @@ class DO:
         # 本地 DO 部分的明文点积
         do_part: List[float] = []
         for vec in self.orthogonal_vectors_for_do:
+            s = 0.0
+            for x, y in zip(b_vector, vec):
+                s += x * y
+            do_part.append(s - r)
+
+        return {'D_sums': D_sums, 'do_part': do_part}
+
+    def safe_mul_round2_process_block(self, payload: Dict[str, Any], b_vector: List[float], start: int, end: int) -> Dict[str, Any]:
+        """
+        æ‰§è¡Œåˆ†å— SafeMul ç¬?è½®ï¼Œä»…å¯¹ DO æ­£äº¤å‘é‡ç»„çš„ä¸€æ®µè¿›è¡Œæ˜Žæ–‡ç‚¹ç§¯ã€?
+        """
+        sip = SafeInnerProduct(precision_factor=self.precision)
+        p = payload['p']
+        alpha = payload['alpha']
+        C_all = payload['C_all']
+
+        r = self._sample_safe_mul_noise(p, alpha)
+        b_vector_ext = list(b_vector) + [r]
+        D_sums = sip.round2_client_process(b_vector_ext, C_all, alpha, p)
+
+        do_part: List[float] = []
+        for vec in self.orthogonal_vectors_for_do[start:end]:
             s = 0.0
             for x, y in zip(b_vector, vec):
                 s += x * y

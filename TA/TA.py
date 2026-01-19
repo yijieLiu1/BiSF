@@ -42,7 +42,8 @@ class TA:
     """联邦学习协议中的可信第三方 (TA)"""
 
     def __init__(self, num_do: int, model_size: int = 10000, orthogonal_vector_count: int = 1024,
-                 bit_length: int = 1024, precision: int = 10**6, k: int = 1 << 48):
+                 bit_length: int = 1024, precision: int = 10**6, k: int = 1 << 48,
+                 data_share_seed: Optional[int] = 2025):
         """
         初始化TA
         Args:
@@ -98,18 +99,87 @@ class TA:
         self._orthogonal_vectors_for_do_list_cache = None
         self._orthogonal_sumvectors_for_csp_list_cache = None
 
+        # 数据分配份额（总和=1，按 DO 分配）
+        self._data_share_seed = data_share_seed
+        self._data_shares: List[float] = []
+
 
         # 轮次管理
         self.current_round: int = 0
         self.key_history: List[Dict] = []  # 存储历史密钥信息
 
         # 初始化正交向量和密钥
+        self._generate_data_shares()
         self._generate_orthogonal_vectors()
         self._key_generation()
 
     # ---------- 工具函数 ----------
     def _lcm(self, a: int, b: int) -> int:
         return a // math.gcd(a, b) * b
+
+    def _generate_data_shares(self) -> None:
+        """按 DO 数量整体分配数据份额（总和=1，尽量均衡）"""
+        seed = self._data_share_seed if self._data_share_seed is not None else 2025
+        rng = random.Random(seed)
+        num_do = max(1, self.num_do)
+        uniform = 1.0 / num_do
+        alpha = 0.3
+        raw = [rng.random() for _ in range(num_do)]
+        raw_sum = sum(raw)
+        if raw_sum <= 0.0:
+            self._data_shares = [uniform] * num_do
+            return
+        raw_norm = [v / raw_sum for v in raw]
+        shares = [(1.0 - alpha) * uniform + alpha * v for v in raw_norm]
+        min_share = 0.5 / num_do
+        if any(s < min_share for s in shares):
+            shares = [max(s, min_share) for s in shares]
+            total = sum(shares)
+            if total > 1.0:
+                excess = [s - min_share for s in shares]
+                excess_sum = sum(excess)
+                if excess_sum > 0.0:
+                    scale = (total - 1.0) / excess_sum
+                    shares = [
+                        s - scale * (s - min_share) if s > min_share else s
+                        for s in shares
+                    ]
+        total = sum(shares)
+        if total > 0.0:
+            shares = [s / total for s in shares]
+        # 保留三位小数，并确保总和为 1.000
+        rounded = [round(s, 3) for s in shares]
+        diff = round(1.0 - sum(rounded), 3)
+        if diff != 0.0:
+            step = 0.001 if diff > 0 else -0.001
+            residuals = [s - r for s, r in zip(shares, rounded)]
+            order = sorted(
+                range(num_do),
+                key=lambda i: residuals[i],
+                reverse=diff > 0,
+            )
+            idx = 0
+            safety = 0
+            while diff != 0.0 and safety < num_do * 4:
+                i = order[idx % num_do]
+                candidate = round(rounded[i] + step, 3)
+                if candidate >= 0.0:
+                    rounded[i] = candidate
+                    diff = round(diff - step, 3)
+                idx += 1
+                safety += 1
+        self._data_shares = rounded
+        print(f"TA生成数据分配份额: {self._data_shares}")
+
+    def get_data_shares(self) -> List[float]:
+        """获取每个 DO 的数据份额（总和=1）"""
+        return list(self._data_shares)
+
+    def get_data_share_for_do(self, do_id: int) -> float:
+        """获取指定 DO 的数据份额"""
+        if 0 <= do_id < len(self._data_shares):
+            return float(self._data_shares[do_id])
+        return 0.0
 
     # ---------- 正交向量 SuperBitLSH,分block思想----------
     # def _generate_orthogonal_vectors(self) -> None:

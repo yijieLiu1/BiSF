@@ -88,6 +88,16 @@ def _compress_vector(vec: List[float], spec: Dict[str, object]) -> List[float]:
             out.append(math.sqrt(s))
     return out
 
+
+def _generate_orthogonal_vectors(dim: int, count: int, seed: int = 2025) -> List[List[float]]:
+    """生成 dim×count 的正交向量组（列正交），用于压缩向量的投影检测。"""
+    if dim <= 0 or count <= 0:
+        return []
+    rng = np.random.default_rng(seed)
+    A = rng.standard_normal(size=(dim, count))
+    Q, _ = np.linalg.qr(A, mode="reduced")
+    return [Q[:, i].astype(float).tolist() for i in range(Q.shape[1])]
+
 def run_federated_simulation(
     num_rounds: int = 30,
     num_do: int = 10,
@@ -135,7 +145,9 @@ def run_federated_simulation(
     bd_trigger_size: int = 2,
     bd_trigger_value: float = 3.0,
     enable_compressed_detect: bool = True,
-    refresh_orthogonal_each_round: bool = True,
+    refresh_orthogonal_each_round: bool = False,
+    safe_mul_block_size: int = 256,
+    enable_all_detection: bool = True,
 ) -> None:
     """
     运行一次联邦学习流程。
@@ -209,12 +221,17 @@ def run_federated_simulation(
     )
     csp = CSP(ta, model_size=model_size, precision=precision, initial_params_path=initial_params_path)
     compression_spec = None
+    compressed_orthogonal_vectors: Optional[List[List[float]]] = None
     if enable_compressed_detect and model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
         compression_spec = _build_resnet20_compression_spec(dataset_name)
         print(
             f"[Test] 启用压缩检测：原始维度 {compression_spec['input_dim']} -> "
             f"{compression_spec['compressed_dim']}"
         )
+        comp_dim = int(compression_spec["compressed_dim"])
+        comp_k = min(int(orthogonal_vector_count), comp_dim)
+        if comp_k > 0:
+            compressed_orthogonal_vectors = _generate_orthogonal_vectors(comp_dim, comp_k)
     attack_do_ids = attack_do_ids or []
 
     do_list: List[Optional[DO]] = []
@@ -297,10 +314,12 @@ def run_federated_simulation(
     detection_logs_raw: List[Dict[str, str]] = []
     detection_logs_proj: List[Dict[str, str]] = []
     detection_logs_comp_raw: List[Dict[str, str]] = []
+    detection_logs_comp_proj: List[Dict[str, str]] = []
     detection_methods = ("multi_krum", "geomedian", "clustering")
     raw_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
     proj_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
     comp_raw_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
+    comp_proj_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
     best_params = None
     best_metric = -1.0  # 优先用 val acc，如果没有则用 train acc
     # 构造统一的运行标签：模型_数据集_do数_场景_轮数
@@ -390,7 +409,7 @@ def run_federated_simulation(
                 print(f"[Test] Round {round_idx} TA refresh failed: {e}")
         round_start = time.time()
         print(f"\n===== Round {round_idx}: 广播参数 =====")
-        global_params = csp.broadcast_params()
+        global_params = csp.broadcast_params(refresh_orthogonal_each_round)
 
         round_timing = {
             "round": round_idx,
@@ -464,61 +483,124 @@ def run_federated_simulation(
             if poisoned is not None:
                 attacker = next((d for d in working_do_list if d is not None and d.id == attacker_id), None)
                 if attacker is not None:
-                    do_cipher_map[attacker_id] = [attacker._encrypt_value(v) for v in poisoned]
+                    share = 1.0
+                    if hasattr(ta, "get_data_share_for_do"):
+                        try:
+                            share = float(ta.get_data_share_for_do(attacker_id))
+                        except Exception:
+                            share = 1.0
+                    if share <= 0.0:
+                        share = 1.0
+                    upload_poisoned = poisoned
+                    if share != 1.0:
+                        upload_poisoned = [share * v for v in poisoned]
+                    do_cipher_map[attacker_id] = [attacker._encrypt_value(v) for v in upload_poisoned]
                     if label != "stealth":
                         clean_update_map[attacker_id] = list(poisoned)
                         if attacker.training_history:
                             attacker.training_history[-1]['local_updates'] = list(poisoned)
+                            attacker.training_history[-1]['uploaded_updates'] = list(upload_poisoned)
 
         active_ids = [d.id for d in working_do_list if d is not None]
         poisoned_ids = _get_poisoned_ids(round_idx, active_ids)
-        # 原始向量投毒检测（未映射）
-        det_raw = run_detection_suite(clean_update_map, "raw_vectors", temporary=True)
-        detection_logs_raw.append({"round": round_idx, "log": det_raw["log"]})
-        raw_suspects = det_raw.get("suspects", {})
-        for method in detection_methods:
-            raw_metrics.update(method, round_idx, raw_suspects.get(method), poisoned_ids, active_ids)
         compressed_updates = None
-        if compression_spec is not None:
-            compressed_updates = {do_id: _compress_vector(vec, compression_spec) for do_id, vec in clean_update_map.items()}
-            det_comp_raw = run_detection_suite(compressed_updates, "compressed_raw_vectors", temporary=True)
-            detection_logs_comp_raw.append({"round": round_idx, "log": det_comp_raw["log"]})
-            comp_raw_suspects = det_comp_raw.get("suspects", {})
+        if enable_all_detection:
+            # 原始向量投毒检测（未映射）
+            det_raw = run_detection_suite(clean_update_map, "raw_vectors", temporary=True)
+            detection_logs_raw.append({"round": round_idx, "log": det_raw["log"]})
+            raw_suspects = det_raw.get("suspects", {})
             for method in detection_methods:
-                comp_raw_metrics.update(method, round_idx, comp_raw_suspects.get(method), poisoned_ids, active_ids)
+                raw_metrics.update(method, round_idx, raw_suspects.get(method), poisoned_ids, active_ids)
+            if compression_spec is not None:
+                compressed_updates = {do_id: _compress_vector(vec, compression_spec) for do_id, vec in clean_update_map.items()}
+                det_comp_raw = run_detection_suite(compressed_updates, "compressed_raw_vectors", temporary=True)
+                detection_logs_comp_raw.append({"round": round_idx, "log": det_comp_raw["log"]})
+                comp_raw_suspects = det_comp_raw.get("suspects", {})
+                for method in detection_methods:
+                    comp_raw_metrics.update(method, round_idx, comp_raw_suspects.get(method), poisoned_ids, active_ids)
+                if compressed_orthogonal_vectors:
+                    comp_proj_map: Dict[int, List[float]] = {}
+                    for do_id, vec in compressed_updates.items():
+                        proj: List[float] = []
+                        for u_vec in compressed_orthogonal_vectors:
+                            s = 0.0
+                            for x, y in zip(vec, u_vec):
+                                s += x * y
+                            proj.append(s)
+                        comp_proj_map[do_id] = proj
+                    det_comp_proj = run_detection_suite(comp_proj_map, "compressed_projection", temporary=True)
+                    detection_logs_comp_proj.append({"round": round_idx, "log": det_comp_proj["log"]})
+                    comp_proj_suspects = det_comp_proj.get("suspects", {})
+                    comp_active_ids = list(comp_proj_map.keys())
+                    for method in detection_methods:
+                        comp_proj_metrics.update(
+                            method, round_idx, comp_proj_suspects.get(method), poisoned_ids, comp_active_ids
+                        )
 
         print(f"\n===== Round {round_idx}: SafeMul 投影计算（在线 DO）=====")
         t1 = time.time()
         csp.do_projection_map.clear()
-        r1t=time.time()
-        ctx = csp.safe_mul_prepare_payload()
-        r1te=time.time()
-        round_timing["csp_safe_mul_prepare"] = r1te - r1t
-        print(f"[Round {round_idx}] SafeMul 准备阶段耗时 {r1te - r1t:.4f}s")
-        for do in [d for d in working_do_list if d is not None]:
-            b_vec = do.get_last_updates()
-            payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
-            r2t=time.time()
-            resp = do.safe_mul_round2_process(payload, b_vec)
-            r2te=time.time()
-            round_timing["do_safe_mul_round2_times"][do.id] = r2te - r2t
-            print(f"[Round {round_idx}] DO {do.id} SafeMul 第二轮处理耗时 {r2te - r2t:.4f}s")
+        online_dos = [d for d in working_do_list if d is not None]
+        block_size = safe_mul_block_size
+        use_block = block_size > 0 and block_size < orthogonal_vector_count
+        if not use_block:
+            r1t = time.time()
+            ctx = csp.safe_mul_prepare_payload()
+            r1te = time.time()
+            round_timing["csp_safe_mul_prepare"] = r1te - r1t
+            print(f"[Round {round_idx}] SafeMul 准备阶段耗时 {r1te - r1t:.4f}s")
+            for do in online_dos:
+                b_vec = do.get_last_updates()
+                payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
+                r2t = time.time()
+                resp = do.safe_mul_round2_process(payload, b_vec)
+                r2te = time.time()
+                round_timing["do_safe_mul_round2_times"][do.id] = r2te - r2t
+                print(f"[Round {round_idx}] DO {do.id} SafeMul 第二轮处理耗时 {r2te - r2t:.4f}s")
 
-            projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'], do.id)
-            r3t=time.time()
-            round_timing["csp_safe_mul_finalize_times"][do.id] = r3t - r2te
-            print(f"[Round {round_idx}] CSP SafeMul 最终化 DO {do.id} 投影耗时 {r3t - r2te:.4f}s")
-            print(f" DO {do.id} 投影向量(长度{len(projection)})")
+                projection = csp.safe_mul_finalize(ctx, resp['D_sums'], resp['do_part'], do.id)
+                r3t = time.time()
+                round_timing["csp_safe_mul_finalize_times"][do.id] = r3t - r2te
+                print(f"[Round {round_idx}] CSP SafeMul 最终化 DO {do.id} 投影耗时 {r3t - r2te:.4f}s")
+                print(f" DO {do.id} 投影向量(长度{len(projection)})")
+        else:
+            proj_map: Dict[int, List[float]] = {d.id: [] for d in online_dos}
+            round_timing["csp_safe_mul_prepare"] = 0.0
+            for start in range(0, orthogonal_vector_count, block_size):
+                end = min(start + block_size, orthogonal_vector_count)
+                r1t = time.time()
+                ctx = csp.safe_mul_prepare_payload_block(start, end)
+                r1te = time.time()
+                print(f"[Round {round_idx}] SafeMul 准备阶段区间[{start},{end})耗时 {r1te - r1t:.4f}s")
+                
+                round_timing["csp_safe_mul_prepare"] += r1te - r1t
+                for do in online_dos:
+                    b_vec = do.get_last_updates()
+                    payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
+                    r2t = time.time()
+                    resp = do.safe_mul_round2_process_block(payload, b_vec, start, end)
+                    print(f"[Round {round_idx}] DO {do.id} SafeMul 第二轮区间[{start},{end})处理耗时 {time.time() - r2t:.4f}s")
+                    r2te = time.time()
+                    round_timing["do_safe_mul_round2_times"][do.id] = round_timing["do_safe_mul_round2_times"].get(do.id, 0.0) + (r2te - r2t)
+                    r3t = time.time()
+                    block_proj = csp.safe_mul_finalize_block(ctx, resp['D_sums'], resp['do_part'])
+                    r3te = time.time()
+                    round_timing["csp_safe_mul_finalize_times"][do.id] = round_timing["csp_safe_mul_finalize_times"].get(do.id, 0.0) + (r3te - r3t)
+                    proj_map[do.id].extend(block_proj)
+            csp.do_projection_map = proj_map
+            for do_id, projection in proj_map.items():
+                print(f" DO {do_id} 投影向量(长度{len(projection)})")
         t2 = time.time()
         print(f"[Round {round_idx}] SafeMul 投影耗时 {t2 - t1:.4f}s")
 
         # 投毒检测（映射后）
-        det_proj = run_detection_suite(csp.do_projection_map, "orthogonal_projection", temporary=False)
-        detection_logs_proj.append({"round": round_idx, "log": det_proj["log"]})
-        proj_suspects = det_proj.get("suspects", {})
-        proj_active_ids = list(csp.do_projection_map.keys())
-        for method in detection_methods:
-            proj_metrics.update(method, round_idx, proj_suspects.get(method), poisoned_ids, proj_active_ids)
+        if enable_all_detection:
+            det_proj = run_detection_suite(csp.do_projection_map, "orthogonal_projection", temporary=False)
+            detection_logs_proj.append({"round": round_idx, "log": det_proj["log"]})
+            proj_suspects = det_proj.get("suspects", {})
+            proj_active_ids = list(csp.do_projection_map.keys())
+            for method in detection_methods:
+                proj_metrics.update(method, round_idx, proj_suspects.get(method), poisoned_ids, proj_active_ids)
 
         print(f"\n===== Round {round_idx}: CSP 聚合 + 解密更新 =====")
         updated_params = csp.round_aggregate_and_update(working_do_list, do_cipher_map)
@@ -692,37 +774,43 @@ def run_federated_simulation(
         os.makedirs(base_dir, exist_ok=True)
         log_path = os.path.join(base_dir, "log.txt")
         summary_lines = []
-        summary_lines.extend(raw_metrics.format_summary("raw_vectors"))
-        summary_lines.extend(proj_metrics.format_summary("orthogonal_projection"))
-        if compression_spec is not None:
-            summary_lines.extend(comp_raw_metrics.format_summary("compressed_raw_vectors"))
+        if enable_all_detection:
+            summary_lines.extend(raw_metrics.format_summary("raw_vectors"))
+            summary_lines.extend(proj_metrics.format_summary("orthogonal_projection"))
+            if compression_spec is not None:
+                summary_lines.extend(comp_raw_metrics.format_summary("compressed_raw_vectors"))
+                summary_lines.extend(comp_proj_metrics.format_summary("compressed_projection"))
         write_test_log(
             log_path=log_path,
             total_elapsed=total_elapsed,
             round_times=round_times,
             eval_history=eval_history,
-            detection_logs_raw=detection_logs_raw,
-            detection_logs_proj=detection_logs_proj,
+            detection_logs_raw=detection_logs_raw if enable_all_detection else [],
+            detection_logs_proj=detection_logs_proj if enable_all_detection else [],
             round_stats=round_stats,
-            detection_logs_comp_raw=detection_logs_comp_raw if compression_spec is not None else None,
-            detection_logs_comp_proj=None,
-            detection_summary_lines=summary_lines,
+            detection_logs_comp_raw=detection_logs_comp_raw if (enable_all_detection and compression_spec is not None) else None,
+            detection_logs_comp_proj=detection_logs_comp_proj if (enable_all_detection and compression_spec is not None) else None,
+            detection_summary_lines=summary_lines if enable_all_detection else None,
             timing_details=round_timing_details,
         )
         print(f"Log saved: {log_path}")
     except Exception as e:
         print(f"保存日志失败: {e}")
 
-    print("\n===== Poison detection summary (raw vectors) =====")
-    for line in raw_metrics.format_summary("raw_vectors"):
-        print(line)
-    print("\n===== Poison detection summary (orthogonal projection) =====")
-    for line in proj_metrics.format_summary("orthogonal_projection"):
-        print(line)
-    if compression_spec is not None:
-        print("\n===== Poison detection summary (compressed raw vectors) =====")
-        for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+    if enable_all_detection:
+        print("\n===== Poison detection summary (raw vectors) =====")
+        for line in raw_metrics.format_summary("raw_vectors"):
             print(line)
+        print("\n===== Poison detection summary (orthogonal projection) =====")
+        for line in proj_metrics.format_summary("orthogonal_projection"):
+            print(line)
+        if compression_spec is not None:
+            print("\n===== Poison detection summary (compressed raw vectors) =====")
+            for line in comp_raw_metrics.format_summary("compressed_raw_vectors"):
+                print(line)
+            print("\n===== Poison detection summary (compressed projection) =====")
+            for line in comp_proj_metrics.format_summary("compressed_projection"):
+                print(line)
 
 
 if __name__ == "__main__":
@@ -732,12 +820,12 @@ if __name__ == "__main__":
     # 以下保持原默认示例参数，可按需扩展更多 CLI
     # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
     parser.add_argument("--num-rounds", type=int, default=15)#联邦轮次
-    parser.add_argument("--num-do", type=int, default=3)#在线DO数
-    parser.add_argument("--model-size", type=int, default=61706)  # cnn:61706 / lenet:81086 / resnet20:272474
-    parser.add_argument("--orthogonal-vector-count", type=int, default=1024)
+    parser.add_argument("--num-do", type=int, default=2)#在线DO数
+    parser.add_argument("--model-size", type=int, default=272474)  # cnn:61706 / lenet:81086 / resnet20:272474
+    parser.add_argument("--orthogonal-vector-count", type=int, default=512)
     parser.add_argument("--refresh-orthogonal-each-round", type=lambda x: str(x).lower() == "true", default=False, help="是否每轮刷新 TA 正交向量组（True/False）")
-    parser.add_argument("--model-name", type=str, default="cnn")    #模型名称：cnn /lenet /resnet20
-    parser.add_argument("--dataset-name", type=str, default="mnist")#数据集名称：mnist /cifar10
+    parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /lenet /resnet20
+    parser.add_argument("--dataset-name", type=str, default="cifar10")#数据集名称：mnist /cifar10
     # DO 训练相关，batch size / max batches
     parser.add_argument("--train-batch-size", type=int, default=64)#训练batch size
     parser.add_argument("--train-max-batches", type=int, default=300)#训练最大batch数
@@ -765,6 +853,8 @@ if __name__ == "__main__":
     parser.add_argument("--bd-trigger-size", type=int, default=2, help="Backdoor trigger size (pixels)")
     parser.add_argument("--bd-trigger-value", type=float, default=3.0, help="Backdoor trigger value (pre-normalization)")
     parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="Enable compressed vector detection (ResNet20 only)")
+    parser.add_argument("--enable-all-detection", type=lambda x: str(x).lower() == "true", default=True, help="是否开启全部投毒检测（True/False）")
+    parser.add_argument("--safe-mul-block-size", type=int, default=1024, help="SafeMul 分块大小，<=0 表示不分块")
     args = parser.parse_args()
 
     attack_rounds = None
@@ -830,4 +920,6 @@ if __name__ == "__main__":
         bd_trigger_value=args.bd_trigger_value,
         enable_compressed_detect=args.enable_compressed_detect,
         refresh_orthogonal_each_round=args.refresh_orthogonal_each_round,
+        safe_mul_block_size=args.safe_mul_block_size,
+        enable_all_detection=args.enable_all_detection,
     )
