@@ -1,10 +1,20 @@
-# Bi-SF 参数说明（CorrectnessTest / EfficiencyTest）
+# Bi-SF：双向验证的联邦学习原型
 
-本仓库已将原 `Train.py` / `Test.py` 调整为：
-- `CorrectnessTest.py`：明文训练与检测（正确性/可解释性）
-- `EfficiencyTest.py`：加密流程联邦仿真（效率/审计/安全向量内积）
+本项目实现了一个带“加密聚合 + 一致性审计 + 投毒检测”的联邦学习原型，包含 TA / DO / CSP / ASP 等参与方，用于验证安全聚合与鲁棒检测在联邦场景下的可行性与开销。
 
-本文只介绍 **命令行参数（parser）** 的使用方式。
+## 参与方与职责
+- **TA（Trusted Authority）**：生成 Paillier 参数、管理每轮 `R_t`、分发 DO 基础私钥并做门限分片。
+- **DO（Data Owner）**：本地训练模型，使用派生密钥加密上传；参与 SafeMul 第2轮并提供掉线恢复分片。
+- **CSP（Cloud/Server）**：聚合密文并解密；执行一致性审计、投毒检测；负责 SafeMul 第1/3轮。
+- **ASP（Audit Server）**：审计辅助方，提供密文修正项，协助 CSP 进行单点审计。
+
+## 项目脚本概览
+- `EfficiencyTest.py`：加密流程联邦仿真（含审计、SafeMul、投毒检测）
+- `CorrectnessTest.py`：明文训练与检测（正确性/可解释性对照）
+
+---
+
+本文重点介绍 **命令行参数（parser）** 的使用方式。
 
 ---
 
