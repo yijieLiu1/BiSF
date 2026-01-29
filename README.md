@@ -1,99 +1,106 @@
-# Bi-SF：双向验证的联邦学习原型
+# Bi-SF 参数说明（CorrectnessTest / EfficiencyTest）
 
-本仓库实现了基于 Improved Paillier、SafeMul 与门限恢复的联邦学习原型，并支持正交向量投影的一致性审计与投毒检测。
+本仓库已将原 `Train.py` / `Test.py` 调整为：
+- `CorrectnessTest.py`：明文训练与检测（正确性/可解释性）
+- `EfficiencyTest.py`：加密流程联邦仿真（效率/审计/安全向量内积）
 
-## 目录结构
-- `utils/`：密码学与工具类（`ImprovedPaillier.py`、`SafeMul.py`、`Threshold.py`、`hash_utils.py`）
-- `TA/`：可信机构（密钥生成、R_t 轮换、分片）
-- `DO/`：数据拥有方（本地训练、加密上传、SafeMul 第2轮、掉线分片提供）
-- `CSP/`：中心服务器（聚合解密、审计、SafeMul 第1/3轮）
-- `ASP/`：审计服务器（用于密文审计辅助）
-- `Test.py`：端到端联邦仿真（含审计与 SafeMul）
-- `Train.py`：明文训练/投毒检测基线
-- `Train2.py`：另一套明文训练脚本（保持原样）
+本文只介绍 **命令行参数（parser）** 的使用方式。
 
-## 核心机制概览
-1) **密钥与轮次派生**
-- TA 生成 Paillier 参数与每个 DO 的基础私钥 `sk_i = R_t^{n_i} mod N^2`
-- DO 使用全局参数哈希派生轮次私钥：`sk_i^hash mod N^2`
-- 哈希逻辑统一在 `utils/hash_utils.py`
+---
 
-2) **掉线与门限恢复**
-- TA 对每个 `sk_i` 做 Shamir 分片
-- DO 掉线时，在线 DO 提供分片，CSP 进行恢复
+## 1. EfficiencyTest.py（加密流程联邦仿真）
 
-3) **SafeMul 安全向量内积**
-- CSP 第1轮加密正交向量组并发送
-- DO 第2轮计算 `D_sums` + 明文 `do_part`
-- CSP 第3轮解密并合并得到投影向量
-- Test/Train 已对 SafeMul 第1轮做缓存以节省时间
-
-4) **正交投影一致性审计**
-- CSP 对聚合结果与投影求和进行一致性判断
-- 不一致时对 DO 逐一审计（可配置阈值）
-
-## 快速开始
-### 1. 创建环境（可选）
-```bash
-python -m venv .venv
-# Windows
-.\.venv\Scripts\Activate.ps1
-# Linux/macOS
-source .venv/bin/activate
-```
-
-### 2. 运行联邦仿真（推荐）
-```bash
-python Test.py
-```
-
-### 3. 运行明文训练基线
-```bash
-python Train.py
-```
-
-## 常用参数（Test.py / Train.py）
-### 模型与数据
-- `--model-name`：`lenet` / `resnet20` / `cnn`
-- `--dataset-name`：`mnist` / `cifar10` / `cifar100`
+### 基本参数
+- `--num-rounds`：联邦轮次
+- `--num-do`：在线 DO 数
 - `--model-size`：模型参数维度
-- `--train-batch-size` / `--train-max-batches`
+- `--model-name`：模型名称（cnn / lenet / resnet20）
+- `--dataset-name`：数据集（mnist / cifar10 / cifar100）
+- `--partition-mode`：数据划分模式（iid / mild / extreme）
+- `--initial-params-path`：初始全局参数文件
 
-### 正交向量
-- `--orthogonal-vector-count`
-- `--refresh-orthogonal-each-round`：每轮刷新正交向量组
+### 训练与评估
+- `--train-batch-size`：训练 batch
+- `--train-max-batches`：每轮最大 batch 数
+- `--eval-each-round`：每轮是否评估
+- `--eval-batch-size`：评估 batch
+- `--eval-batches`：评估 batch 上限
+- `--bn-calib-batches`：BN 校准批数（ResNet）
 
-### SafeMul 分块
-- `--safe-mul-block-size`：`<=0` 表示不分块
+### 正交向量与 SafeMul
+- `--orthogonal-vector-count`：正交向量数量
+- `--refresh-orthogonal-each-round`：是否每轮刷新正交向量
+- `--safe-mul-block-size`：SafeMul 分块大小（<=0 不分块）
 
-### 审计与投毒检测
-- `--enable-all-detection`：是否开启检测
-- `--detection-methods`：选择方案  
-  支持 `all` 或 `multi,geo,cluster`（逗号分隔）
-- `--audit-round` / `--audit-do-id`
-- `--audit-simulate-dropout` / `--audit-simulate-mismatch`
+### 投毒与攻击
+- `--attack-type`：untarget 攻击类型（stealth/random/signflip/lie_stat）
+- `--attack-round-untarget`：untarget 攻击轮次（all / 单轮 / 多轮）
+- `--attack-lambda`：放大系数
+- `--attack-sigma`：random 攻击噪声
+- `--attack-do-id`：攻击 DO id（逗号分隔）
+- `--attack-rounds`：label flip 轮次（all / 逗号）
+- `--source-label` / `--target-label` / `--poison-ratio`
+- `--bd-enable` / `--bd-target-label` / `--bd-ratio` / `--bd-trigger-size` / `--bd-trigger-value`
 
-### 典型示例
-只用 Multi-Krum：
+### 投毒检测
+- `--enable-all-detection`：是否启用投毒检测
+- `--enable-compressed-detect`：启用压缩向量检测（ResNet20）
+- `--detection-methods`：检测方法选择  
+  取值：`all` / `multi` / `geo` / `cluster` / 组合如 `multi,geo`
+
+### 审计模拟
+- `--audit-round`：审计轮次
+- `--audit-do-id`：审计 DO id（逗号分隔）
+- `--audit-simulate-dropout`：模拟掉线
+- `--audit-simulate-mismatch`：SafeMul 与加密不一致
+
+---
+
+## 2. CorrectnessTest.py（明文训练与检测）
+
+### 基本参数
+- `--rounds`：训练轮次
+- `--num-do`：DO 数
+- `--model-name` / `--dataset-name`
+- `--batch-size` / `--max-batches`
+- `--partition-mode`：iid / mild / extreme
+
+### 投毒与攻击
+- `--poison-do-id`：攻击 DO 列表（逗号）
+- `--source-label` / `--target-label` / `--poison-ratio`
+- `--attack-type`：untarget 攻击类型（stealth/random/signflip/lie_stat）
+- `--attack-round-untarget`：触发轮次（all / 单轮 / 多轮）
+- `--attack-lambda` / `--attack-sigma`
+- `--bd-enable` / `--bd-target-label` / `--bd-ratio` / `--bd-trigger-size` / `--bd-trigger-value`
+
+### 投毒检测
+- `--enable-all-detection`
+- `--enable-compressed-detect`
+- `--proj-block-size`：正交投影分块
+- `--refresh-orthogonal-each-round`
+- `--detection-methods`：检测方法选择（同上）
+
+### 评估与输出
+- `--save-path`：保存目录
+- `--initial-params-path`
+- `--eval-batch-size` / `--eval-batches`
+- `--bn-calib-batches`
+
+---
+
+## 3. 示例
+
+仅启用 Multi-Krum：
 ```bash
-python Test.py --detection-methods multi
+python EfficiencyTest.py --detection-methods multi
 ```
 
-只用 GeoMedian：
+仅启用 GeoMedian：
 ```bash
-python Train.py --detection-methods geo
+python CorrectnessTest.py --detection-methods geo
 ```
 
-全部检测：
+启用全部检测：
 ```bash
-python Test.py --detection-methods all
+python EfficiencyTest.py --detection-methods all
 ```
-
-## 调试建议
-- `cipher_sum` 异常且所有 DO 相同：优先检查 `params_hash`、`sum_weights`、`rt_pow` 是否一致
-- 审计中负权重求逆失败：检查密文是否可逆（`gcd(c, N^2) == 1`）
-- DO/CSP/ASP hash 不一致：确保都使用 `utils/hash_utils.py`
-
-## 说明
-本项目偏研究原型，默认参数较大（如正交向量数量、模型维度），运行时间较长。  
-可通过降低 `--orthogonal-vector-count`、`--train-max-batches`、`--safe-mul-block-size` 进行加速。
