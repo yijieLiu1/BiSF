@@ -42,7 +42,7 @@ class TA:
     """联邦学习协议中的可信第三方 (TA)"""
 
     def __init__(self, num_do: int, model_size: int = 10000, orthogonal_vector_count: int = 1024,
-                 bit_length: int = 1024, precision: int = 10**6, k: int = 1 << 48,
+                 bit_length: int = 2048, precision: int = 10**6, k: int = 1 << 48,
                  data_share_seed: Optional[int] = 2025):
         """
         初始化TA

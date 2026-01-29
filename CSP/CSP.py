@@ -4,20 +4,29 @@ import time
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import hashlib
 import math
 import random
 from typing import List, Dict, Optional
 from utils.ImprovedPaillier import ImprovedPaillier
 from utils.Threshold import recover_secret
 from utils.SafeMul import SafeInnerProduct
+from utils.hash_utils import hash_global_params
 
 
 class CSP:
     """中心服务器（CSP）"""
 
-    def __init__(self, ta, model_size: Optional[int] = None, precision: int = 10 ** 6, initial_params_path: Optional[str] = None):
+    def __init__(self, ta, model_size: Optional[int] = None, precision: int = 10 ** 6,
+                 initial_params_path: Optional[str] = None, asp: Optional[object] = None,
+                 audit_weight_scale: Optional[int] = None):
         self.ta = ta
+        self.asp = asp
+        if audit_weight_scale is None:
+            if asp is not None and hasattr(asp, "weight_scale"):
+                audit_weight_scale = int(asp.weight_scale)
+            else:
+                audit_weight_scale = 100
+        self.audit_weight_scale = int(audit_weight_scale)
         self.data_shares: List[float] = []
         if hasattr(self.ta, "get_data_shares"):
             try:
@@ -252,15 +261,7 @@ class CSP:
         print(f"[CSP] 在线DO: {[d.id for d in online_dos]}, 掉线DO: {missing_ids}")
         # 计算当前全局参数哈希，如果有DO掉线了，需要使用
         # 对于大向量，使用采样策略提高效率
-        if len(self.global_params_snapshot) > 10000:
-            sample_size = 3000
-            step = len(self.global_params_snapshot) // sample_size
-            sampled = self.global_params_snapshot[::max(1, step)][:sample_size]
-            sampled = self.global_params_snapshot[:1000] + self.global_params_snapshot[len(self.global_params_snapshot)//2:len(self.global_params_snapshot)//2+1000] + self.global_params_snapshot[-1000:]
-            params_bytes = str(sampled).encode('utf-8')
-        else:
-            params_bytes = str(self.global_params_snapshot).encode('utf-8')
-        params_hash = int.from_bytes(hashlib.sha256(params_bytes).digest(), 'big', signed=False)
+        params_hash = hash_global_params(self.global_params_snapshot)
 
         if not missing_ids:
 
@@ -277,11 +278,17 @@ class CSP:
         consistency = self.compare_consistency(summed)
         print(f"[CSP] 判断正交求和是否一致{consistency}")
         if not consistency:
-            suspects = self.locate_inconsistent_dos(do_list, do_cipher_map, params_hash)
-            if suspects:
-                print(f"[CSP] 二分定位可疑 DO: {suspects}")
+            if self.asp is None:
+                print("[CSP] 一致性不通过，未配置 ASP，跳过单点审计")
             else:
-                print("[CSP] 未能定位具体可疑 DO")
+                audit_start = time.time()
+                suspects = self.audit_all_dos_by_cipher(do_cipher_map, params_hash=params_hash)
+                audit_end = time.time()
+                print(f"[CSP] 单点审计耗时: {audit_end - audit_start:.4f}秒")
+                if suspects:
+                    print(f"[CSP] 单点审计可疑 DO: {suspects}")
+                else:
+                    print("[CSP] 单点审计未发现可疑 DO")
         print(f"[CSP] 解密后的聚合结果维度: {len(summed)}")
         print(f"[CSP] 聚合结果前10维: {summed[:10]}")
         print(f"[CSP] 聚合结果范围: [{min(summed):.4f}, {max(summed):.4f}]")
@@ -327,6 +334,81 @@ class CSP:
         is_consistent = abs(sum_wu - sum_proj) <= tol
         print(f"[CSP] 一致性判断: {is_consistent}")
         return is_consistent
+
+    def _get_v_star_int(self) -> List[int]:
+        v_star = self.ta.get_orthogonal_sumvectors_for_csp()
+        scale = int(self.audit_weight_scale)
+        return [int(round(v * scale)) for v in v_star]
+
+    def _ciphertext_weighted_sum(self, cipher_vec: List[int], weights_int: List[int]) -> int:
+        """计算单个 DO 的密文加权求和：∏ c_i^(w_i) mod N^2。"""
+        N2 = self.impaillier.N2
+        result = 1
+        for c, w in zip(cipher_vec, weights_int):
+            if w == 0:
+                continue
+            if w > 0:
+                result = (result * pow(c, w, N2)) % N2
+            else:
+                inv = pow(c, -1, N2)
+                result = (result * pow(inv, -w, N2)) % N2
+        return result
+
+    def audit_single_do_by_cipher(self, do_id: int, do_cipher_map: Dict[int, List[int]],
+                                  tol: float = 0.3, params_hash: Optional[int] = None) -> Optional[Dict[str, float]]:
+        """基于密文与 SafeMul 结果对单个 DO 做一致性检查。"""
+        if do_id not in do_cipher_map:
+            return None
+        if do_id not in self.do_projection_map:
+            print(f"[CSP] DO {do_id} 缺少投影结果，跳过单点审计")
+            return None
+        v_star_int = self._get_v_star_int()
+        cipher_vec = do_cipher_map[do_id]
+        if len(cipher_vec) != len(v_star_int):
+            print(f"[CSP] DO {do_id} 密文长度不匹配 V*: {len(cipher_vec)} != {len(v_star_int)}")
+            return None
+        
+
+        combined = self._ciphertext_weighted_sum(cipher_vec, v_star_int)
+        if self.asp is not None:
+            rt_pow = self.asp.get_rt_pow_for_do(do_id, params_hash=params_hash)
+            if rt_pow is not None:
+                combined = (combined * rt_pow) % self.impaillier.N2
+        # Debug: 仅在 DO 0 打印一次关键审计信息，避免刷屏
+        if do_id == 0:
+            sum_weights = getattr(self.asp, "sum_weights", None) if self.asp is not None else None
+            gcd_val = math.gcd(combined, self.impaillier.N2)
+            print(
+                f"[CSP][AuditDebug] do_id={do_id}, params_hash={params_hash}, "
+                f"sum_weights={sum_weights}, gcd(combined,N2)={gcd_val}, "
+                f"combined_bitlen={combined.bit_length()}"
+            )
+        cipher_sum = self.impaillier.decrypt(combined)
+        sum_wu = float(sum(self.do_projection_map[do_id]))
+        share = 1.0
+        if self.data_shares and 0 <= do_id < len(self.data_shares):
+            share = float(self.data_shares[do_id])
+        sum_wu *= share
+        cipher_sum /= float(self.audit_weight_scale)
+        print(f"[CSP][Audit] y/2={self.impaillier.y/2}")
+        diff = abs(sum_wu - cipher_sum)
+        return {"sum_wu": sum_wu, "cipher_sum": cipher_sum, "diff": diff, "ok": diff <= tol}
+
+    def audit_all_dos_by_cipher(self, do_cipher_map: Dict[int, List[int]], tol: float = 0.5,
+                                params_hash: Optional[int] = None) -> List[int]:
+        """对所有 DO 逐个进行密文一致性审计，返回可疑 DO 列表。"""
+        suspects: List[int] = []
+        for do_id in do_cipher_map.keys():
+            result = self.audit_single_do_by_cipher(do_id, do_cipher_map, tol=tol, params_hash=params_hash)
+            if result is None:
+                continue
+            print(
+                f"[CSP][Audit] DO {do_id}: sum_wu={result['sum_wu']:.6f}, "
+                f"cipher_sum={result['cipher_sum']:.6f}, diff={result['diff']:.6f}"
+            )
+            if not result["ok"]:
+                suspects.append(do_id)
+        return suspects
 
     def _subset_projection_sum(self, subset_ids: List[int]) -> Optional[float]:
         if not self.do_projection_map:

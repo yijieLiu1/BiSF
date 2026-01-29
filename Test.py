@@ -25,6 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
 from TA.TA import TA
 from CSP.CSP import CSP
+from ASP.ASP import ASP
 from DO.DO import DO
 import ModelTest
 from utils.detection_metrics import DetectionMetricsTracker
@@ -148,6 +149,11 @@ def run_federated_simulation(
     refresh_orthogonal_each_round: bool = False,
     safe_mul_block_size: int = 256,
     enable_all_detection: bool = True,
+    detection_methods: Optional[List[str]] = None,
+    audit_round: Optional[int] = None,
+    audit_do_ids: Optional[List[int]] = None,
+    audit_simulate_dropout: bool = False,
+    audit_simulate_mismatch: bool = False,
 ) -> None:
     """
     运行一次联邦学习流程。
@@ -162,6 +168,9 @@ def run_federated_simulation(
           - attack_type: stealth / random / signflip / lie_stat
           - attack_do_ids: 哪些 DO 做 untarget 投毒
           - attack_round / attack_rounds_untarget: 触发轮次
+    - 审计模拟（单轮）：可指定 DO 在特定轮次
+        * audit_simulate_dropout: 直接掉线（不参与加密与 SafeMul）
+        * audit_simulate_mismatch: SafeMul 使用与加密不一致的本地参数
 
     注意：同一个 attack_do_ids 列表同时被 label flip 和 untarget 两类攻击复用，
     是否真正“生效”取决于是否同时满足各自所需的参数组合。
@@ -219,7 +228,16 @@ def run_federated_simulation(
         bit_length=bit_length,
         precision=precision,
     )
-    csp = CSP(ta, model_size=model_size, precision=precision, initial_params_path=initial_params_path)
+    audit_weight_scale = 1000
+    asp = ASP.from_ta(ta, weight_scale=audit_weight_scale)
+    csp = CSP(
+        ta,
+        model_size=model_size,
+        precision=precision,
+        initial_params_path=initial_params_path,
+        asp=asp,
+        audit_weight_scale=audit_weight_scale,
+    )
     compression_spec = None
     compressed_orthogonal_vectors: Optional[List[List[float]]] = None
     if enable_compressed_detect and model_name.lower() in ("resnet20", "resnet20_cifar", "resnet"):
@@ -233,6 +251,7 @@ def run_federated_simulation(
         if comp_k > 0:
             compressed_orthogonal_vectors = _generate_orthogonal_vectors(comp_dim, comp_k)
     attack_do_ids = attack_do_ids or []
+    audit_do_ids = audit_do_ids or []
 
     do_list: List[Optional[DO]] = []
     for i in range(num_do):
@@ -290,9 +309,12 @@ def run_federated_simulation(
             print(f"\n----- Detection ({label}) -----")
             active_count = len(csp.do_projection_map)
             if active_count >= 2:
-                suspects_multi = csp.detect_poison_multi_krum(f=2, alpha=1.5)
-                suspects_geo = csp.detect_poison_geomedian(beta=1.5)
-                suspects_cluster = csp.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
+                if "multi_krum" in detection_methods:
+                    suspects_multi = csp.detect_poison_multi_krum(f=2, alpha=1.5)
+                if "geomedian" in detection_methods:
+                    suspects_geo = csp.detect_poison_geomedian(beta=1.5)
+                if "clustering" in detection_methods:
+                    suspects_cluster = csp.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
             else:
                 print("[Detect] Not enough active DOs, skip.")
         output = buf.getvalue()
@@ -315,7 +337,10 @@ def run_federated_simulation(
     detection_logs_proj: List[Dict[str, str]] = []
     detection_logs_comp_raw: List[Dict[str, str]] = []
     detection_logs_comp_proj: List[Dict[str, str]] = []
-    detection_methods = ("multi_krum", "geomedian", "clustering")
+    if detection_methods:
+        detection_methods = tuple(detection_methods)
+    else:
+        detection_methods = ("multi_krum", "geomedian", "clustering")
     raw_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
     proj_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
     comp_raw_metrics = DetectionMetricsTracker(num_rounds, detection_methods)
@@ -401,6 +426,8 @@ def run_federated_simulation(
                 poisoned.add(do_id)
         return poisoned
 
+    safe_mul_ctx_cache = None
+    safe_mul_block_ctx_cache: Dict[tuple, Dict[str, object]] = {}
     for round_idx in range(1, num_rounds + 1):
         if refresh_orthogonal_each_round and round_idx > 1:
             try:
@@ -420,11 +447,15 @@ def run_federated_simulation(
             "csp_safe_mul_finalize_times": {},
         }
 
-        # 掉线处理
+        # 掉线处理（含审计模拟掉线）
         working_do_list: List[Optional[DO]] = list(do_list)
         for drop_id in dropouts.get(round_idx, []):
             if 0 <= drop_id < len(working_do_list):
                 working_do_list[drop_id] = None
+        if audit_round is not None and round_idx == audit_round and audit_simulate_dropout:
+            for drop_id in audit_do_ids:
+                if 0 <= drop_id < len(working_do_list):
+                    working_do_list[drop_id] = None
         offline_ids = [i for i, d in enumerate(working_do_list) if d is None]
         if offline_ids:
             print(f"[Round {round_idx}] 模拟掉线 DO: {offline_ids}")
@@ -433,12 +464,18 @@ def run_federated_simulation(
         print(f"\n===== Round {round_idx}: DO 训练并加密 =====")
         do_cipher_map: Dict[int, List[int]] = {}
         clean_update_map: Dict[int, List[float]] = {}
+        audit_mismatch_map: Dict[int, List[float]] = {}
         for do in [d for d in working_do_list if d is not None]:
             t_enc_start = time.time()
             ciphertexts = do.train_and_encrypt(global_params)
             t_enc_end = time.time()
             do_cipher_map[do.id] = ciphertexts
             clean_update_map[do.id] = do.get_last_updates()
+            if audit_round is not None and round_idx == audit_round and audit_simulate_mismatch:
+                if do.id in audit_do_ids:
+                    base_vec = do.get_last_updates()
+                    audit_mismatch_map[do.id] = [-v for v in base_vec]
+                    print(f"[Round {round_idx}] 审计模拟：DO {do.id} SafeMul 使用不一致参数")
             enc_time = getattr(do, "last_encrypt_time", None)
             if enc_time is None:
                 enc_time = t_enc_end - t_enc_start
@@ -543,14 +580,19 @@ def run_federated_simulation(
         online_dos = [d for d in working_do_list if d is not None]
         block_size = safe_mul_block_size
         use_block = block_size > 0 and block_size < orthogonal_vector_count
+        if refresh_orthogonal_each_round and round_idx > 1:
+            safe_mul_ctx_cache = None
+            safe_mul_block_ctx_cache.clear()
         if not use_block:
             r1t = time.time()
-            ctx = csp.safe_mul_prepare_payload()
+            if safe_mul_ctx_cache is None:
+                safe_mul_ctx_cache = csp.safe_mul_prepare_payload()
+            ctx = safe_mul_ctx_cache
             r1te = time.time()
             round_timing["csp_safe_mul_prepare"] = r1te - r1t
             print(f"[Round {round_idx}] SafeMul 准备阶段耗时 {r1te - r1t:.4f}s")
             for do in online_dos:
-                b_vec = do.get_last_updates()
+                b_vec = audit_mismatch_map.get(do.id, do.get_last_updates())
                 payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
                 r2t = time.time()
                 resp = do.safe_mul_round2_process(payload, b_vec)
@@ -569,13 +611,16 @@ def run_federated_simulation(
             for start in range(0, orthogonal_vector_count, block_size):
                 end = min(start + block_size, orthogonal_vector_count)
                 r1t = time.time()
-                ctx = csp.safe_mul_prepare_payload_block(start, end)
+                cache_key = (start, end)
+                if cache_key not in safe_mul_block_ctx_cache:
+                    safe_mul_block_ctx_cache[cache_key] = csp.safe_mul_prepare_payload_block(start, end)
+                ctx = safe_mul_block_ctx_cache[cache_key]
                 r1te = time.time()
                 print(f"[Round {round_idx}] SafeMul 准备阶段区间[{start},{end})耗时 {r1te - r1t:.4f}s")
                 
                 round_timing["csp_safe_mul_prepare"] += r1te - r1t
                 for do in online_dos:
-                    b_vec = do.get_last_updates()
+                    b_vec = audit_mismatch_map.get(do.id, do.get_last_updates())
                     payload = {'p': ctx['p'], 'alpha': ctx['alpha'], 'C_all': ctx['C_all']}
                     r2t = time.time()
                     resp = do.safe_mul_round2_process_block(payload, b_vec, start, end)
@@ -820,11 +865,11 @@ if __name__ == "__main__":
     # 以下保持原默认示例参数，可按需扩展更多 CLI
     # num_rounds: 轮次 / num_do: DO 数 / model_size: 模型参数规模
     parser.add_argument("--num-rounds", type=int, default=15)#联邦轮次
-    parser.add_argument("--num-do", type=int, default=2)#在线DO数
+    parser.add_argument("--num-do", type=int, default=3)#在线DO数
     parser.add_argument("--model-size", type=int, default=272474)  # cnn:61706 / lenet:81086 / resnet20:272474
-    parser.add_argument("--orthogonal-vector-count", type=int, default=512)
+    parser.add_argument("--orthogonal-vector-count", type=int, default=2048)
     parser.add_argument("--refresh-orthogonal-each-round", type=lambda x: str(x).lower() == "true", default=False, help="是否每轮刷新 TA 正交向量组（True/False）")
-    parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /lenet /resnet20
+    parser.add_argument("--model-name", type=str, default="resnet20")    #模型名称：cnn /resnet20
     parser.add_argument("--dataset-name", type=str, default="cifar10")#数据集名称：mnist /cifar10
     # DO 训练相关，batch size / max batches
     parser.add_argument("--train-batch-size", type=int, default=64)#训练batch size
@@ -832,30 +877,69 @@ if __name__ == "__main__":
     parser.add_argument("--partition-mode",type=str,default="iid",help="数据划分模式：iid / mild / extreme（控制各 DO 的本地数据是否 non-IID）")
     # 评估相关
     parser.add_argument("--eval-each-round", dest="eval_each_round", action="store_true", default=True, help="开启每轮明文评估（会额外耗时，默认开启）")
-    #parser.add_argument("--no-eval-each-round", dest="eval_each_round", action="store_false", help="关闭每轮明文评估")暂时没用
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--eval-batches", type=int, default=50)
-    #target攻击： label flip 相关参数 source_label:源标签 / target_label:目标标签 / attack_do_id:攻击 DO id / attack_rounds:攻击轮次 / poison_ratio:翻转比例：该 batch 的源类样本中随机抽 30% 改标签，其余不动
-    parser.add_argument("--attack-do-id",type=str,default="0,1",help="攻击 DO id（同时用于 label flip 和 untarget 投毒）如0,1；留空则不攻击（无需引号）")
-    parser.add_argument("--source-label", type=int, default=None, help="若需监测 label flip，指定源标签，如2，代表把数据集中的2类数据投毒成3类数据")
-    parser.add_argument("--target-label", type=int, default=None, help="若需监测 label flip，指定目标标签，如3，代表把数据集中的2类数据投毒成3类数据") 
-    parser.add_argument("--attack-rounds", type=str, default="all", help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发")
-    parser.add_argument("--poison-ratio", type=float, default=1.0, help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）")
+    
+    
     # untarget 梯度/参数投毒配置（与 label flip 解耦；留空则完全不启用 untarget）
     parser.add_argument("--attack-type",type=str,default=None,help="untarget 梯度/参数投毒类型：stealth/random/signflip/lie_stat；留空则不启用")
     parser.add_argument("--attack-round-untarget",type=str,default=None,help="untarget 梯度/参数投毒触发轮次：单个数字、逗号列表或 all；留空则不触发")
     parser.add_argument("--attack-lambda", type=float, default=0.2, help="untarget 投毒放大系数（stealth/signflip/lie_stat 使用）")
     parser.add_argument("--attack-sigma", type=float, default=1.0, help="untarget random 投毒的标准差")
+    
+    
+    #target攻击： label flip 相关参数 source_label:源标签 / target_label:目标标签 / attack_do_id:攻击 DO id / attack_rounds:攻击轮次 / poison_ratio:翻转比例：该 batch 的源类样本中随机抽 30% 改标签，其余不动
+    parser.add_argument("--attack-do-id",type=str,default=None,help="攻击 DO id-0,1（同时用于 label flip 和 untarget 投毒）如0,1；留空则不攻击（无需引号）")
+    parser.add_argument("--source-label", type=int, default=None, help="若需监测 label flip，指定源标签，如2，代表把数据集中的2类数据投毒成3类数据")
+    parser.add_argument("--target-label", type=int, default=None, help="若需监测 label flip，指定目标标签，如3，代表把数据集中的2类数据投毒成3类数据") 
+    parser.add_argument("--attack-rounds", type=str, default="all", help="label flip 的攻击轮次，逗号分隔如 3,4,5，或 all 表示每轮；留空默认不触发")
+    parser.add_argument("--poison-ratio", type=float, default=1.0, help="label flip 翻转比例，默认 0.3（源类样本内随机抽该比例改成目标标签）")
     # backdoor (BadNets-style) config
-    parser.add_argument("--bd-enable", type=lambda x: str(x).lower() == "true", default=True, help="Enable backdoor (BadNets) when set to True, e.g. --bd-enable True")
+    parser.add_argument("--bd-enable", type=lambda x: str(x).lower() == "true", default=False, help="Enable backdoor (BadNets) when set to True, e.g. --bd-enable True")
     parser.add_argument("--bd-target-label", type=int, default=9, help="Backdoor target label")
     parser.add_argument("--bd-ratio", type=float, default=0.3, help="Backdoor injection ratio in source class")
     parser.add_argument("--bd-trigger-size", type=int, default=2, help="Backdoor trigger size (pixels)")
     parser.add_argument("--bd-trigger-value", type=float, default=3.0, help="Backdoor trigger value (pre-normalization)")
-    parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=True, help="Enable compressed vector detection (ResNet20 only)")
+    
+    #压缩向量检测相关，是否分块，是否开启投毒检测
+    parser.add_argument("--enable-compressed-detect", type=lambda x: str(x).lower() == "true", default=False, help="Enable compressed vector detection (ResNet20 only)")
     parser.add_argument("--enable-all-detection", type=lambda x: str(x).lower() == "true", default=True, help="是否开启全部投毒检测（True/False）")
-    parser.add_argument("--safe-mul-block-size", type=int, default=1024, help="SafeMul 分块大小，<=0 表示不分块")
+    parser.add_argument("--detection-methods", type=str, default="all", help="投毒检测方案：all 或 multi,geo,cluster（逗号分隔）")
+    parser.add_argument("--safe-mul-block-size", type=int, default=512, help="SafeMul 分块大小，<=0 表示不分块")
+    # 审计模拟相关：DO掉线，DO恶意使用不一致模型参数
+    parser.add_argument("--audit-round", type=int, default=1, help="审计模拟轮次（单轮）")
+    parser.add_argument("--audit-do-id", type=str, default="1", help="审计模拟的 DO id，逗号分隔如 0,1")
+    parser.add_argument("--audit-simulate-dropout", type=lambda x: str(x).lower() == "true", default=False, help="审计模拟：是否让指定 DO 掉线")
+    parser.add_argument("--audit-simulate-mismatch", type=lambda x: str(x).lower() == "true", default=True, help="审计模拟：SafeMul 与加密参数不一致")
     args = parser.parse_args()
+
+    def _parse_detection_methods(raw: str) -> List[str]:
+        if raw is None:
+            return []
+        text = str(raw).strip().lower()
+        if not text:
+            return []
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if not parts or "all" in parts:
+            return ["multi_krum", "geomedian", "clustering"]
+        mapping = {
+            "multi": "multi_krum",
+            "multi_krum": "multi_krum",
+            "geo": "geomedian",
+            "geomedian": "geomedian",
+            "cluster": "clustering",
+            "clustering": "clustering",
+        }
+        selected: List[str] = []
+        for p in parts:
+            method = mapping.get(p)
+            if method and method not in selected:
+                selected.append(method)
+        if not selected:
+            return ["multi_krum", "geomedian", "clustering"]
+        return selected
+
+    selected_methods = _parse_detection_methods(args.detection_methods)
 
     attack_rounds = None
     if args.attack_rounds:
@@ -922,4 +1006,9 @@ if __name__ == "__main__":
         refresh_orthogonal_each_round=args.refresh_orthogonal_each_round,
         safe_mul_block_size=args.safe_mul_block_size,
         enable_all_detection=args.enable_all_detection,
+        detection_methods=selected_methods,
+        audit_round=args.audit_round,
+        audit_do_ids=[int(x) for x in args.audit_do_id.split(",") if x.strip()] if args.audit_do_id else [],
+        audit_simulate_dropout=args.audit_simulate_dropout,
+        audit_simulate_mismatch=args.audit_simulate_mismatch,
     )

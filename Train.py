@@ -215,8 +215,35 @@ def main() -> None:
     parser.add_argument("--proj-block-size", type=int, default=512, help="正交投影分块大小，默认 256，<=0 表示不分块")
     parser.add_argument("--refresh-orthogonal-each-round", type=lambda x: str(x).lower() == "true", default=False, help="是否每轮刷新 TA 正交向量组（True/False）")
     parser.add_argument("--enable-all-detection", type=lambda x: str(x).lower() == "true", default=True, help="是否开启全部投毒检测（True/False）")
+    parser.add_argument("--detection-methods", type=str, default="all", help="投毒检测方案：all 或 multi,geo,cluster（逗号分隔）")
     args = parser.parse_args()
     enable_all_detection = bool(args.enable_all_detection)
+    def _parse_detection_methods(raw: str) -> List[str]:
+        if raw is None:
+            return []
+        text = str(raw).strip().lower()
+        if not text:
+            return []
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if not parts or "all" in parts:
+            return ["multi_krum", "geomedian", "clustering"]
+        mapping = {
+            "multi": "multi_krum",
+            "multi_krum": "multi_krum",
+            "geo": "geomedian",
+            "geomedian": "geomedian",
+            "cluster": "clustering",
+            "clustering": "clustering",
+        }
+        selected: List[str] = []
+        for p in parts:
+            method = mapping.get(p)
+            if method and method not in selected:
+                selected.append(method)
+        if not selected:
+            return ["multi_krum", "geomedian", "clustering"]
+        return selected
+    selected_methods = _parse_detection_methods(args.detection_methods)
 
     # 解析 target label flip 轮次
     attack_rounds = None
@@ -320,7 +347,7 @@ def main() -> None:
     detection_logs_comp_proj: List[Dict[str, str]] = []
     best_params = None
     best_val_acc = -1.0
-    detection_methods = ("multi_krum", "geomedian", "clustering")
+    detection_methods = tuple(selected_methods) if selected_methods else ("multi_krum", "geomedian", "clustering")
     raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     proj_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
     comp_raw_metrics = DetectionMetricsTracker(args.rounds, detection_methods)
@@ -349,9 +376,12 @@ def main() -> None:
             active_count = len(csp_detector.do_projection_map)
             if active_count >= 2:
                 # 这里参数与 Test.py 中保持一致，后续可按需调整敏感度
-                suspects_multi = csp_detector.detect_poison_multi_krum(f=4, alpha=1.5)
-                suspects_geo = csp_detector.detect_poison_geomedian(beta=1.5)
-                suspects_cluster = csp_detector.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
+                if "multi_krum" in detection_methods:
+                    suspects_multi = csp_detector.detect_poison_multi_krum(f=4, alpha=1.5)
+                if "geomedian" in detection_methods:
+                    suspects_geo = csp_detector.detect_poison_geomedian(beta=1.5)
+                if "clustering" in detection_methods:
+                    suspects_cluster = csp_detector.detect_poison_clustering(k=min(3, active_count), alpha=1.5)
                 # csp_detector.detect_poison_lasa_lite(angle_threshold=0.0, beta=1.5)
             else:
                 print("[检测] 在线 DO 数不足，跳过。")
@@ -414,6 +444,7 @@ def main() -> None:
         return poisoned
 
     total_start = time.time()
+    cached_orthogonal_vectors = None
     for r in range(1, args.rounds + 1):
         round_start = time.time()
         print(f"\n----- Round {r}/{args.rounds} -----")
@@ -480,7 +511,11 @@ def main() -> None:
             print(f"\n===== Round {r}: 正交投影计算（Plain，在线 DO）=====")
             t1 = time.time()
             proj_map: Dict[int, List[float]] = {}
-            U = ta.get_orthogonal_vectors()  # List[List[float]]，形状: [orthogonal_count][model_size]
+            if args.refresh_orthogonal_each_round and r > 1:
+                cached_orthogonal_vectors = None
+            if cached_orthogonal_vectors is None:
+                cached_orthogonal_vectors = ta.get_orthogonal_vectors()
+            U = cached_orthogonal_vectors  # List[List[float]]，形状: [orthogonal_count][model_size]
             if  U:
                 for do_id, vec in updates.items():
                     # 1×d 向量与 k×d 正交向量组逐个点积，按分块流式处理

@@ -16,10 +16,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import random
 import math
-import hashlib
 from typing import List, Optional, Dict, Any
 from utils.ImprovedPaillier import ImprovedPaillier
 from utils.SafeMul import SafeInnerProduct
+from utils.hash_utils import hash_global_params, hash_text_prefix
 
 # 可选 NumPy 加速（大规模参数时建议安装）
 try:
@@ -491,7 +491,7 @@ class DO:
         share_key = ""
         if shares and target_sizes:
             share_str = ",".join(f"{s:.6f}" for s in shares)
-            share_key = f"_share{hashlib.sha256(share_str.encode('utf-8')).hexdigest()[:8]}"
+            share_key = f"_share{hash_text_prefix(share_str, 8)}"
         shard_cache_key = f"{name}_mode{mode}_n{num_do}{share_key}_root{data_root}"
         if shard_cache_key not in DO._sharded_indices_cache:
             num_classes = meta["num_classes"]
@@ -834,24 +834,7 @@ class DO:
         Returns:
             哈希值的整数表示
         """
-        # 对于大向量，使用采样策略：每隔一定间隔采样，确保哈希的稳定性
-        if len(global_params) > 10000:
-            # 采样策略：取前1000个、中间1000个、后1000个，以及每隔一定间隔的样本
-            sample_size = 3000
-            step = len(global_params) // sample_size
-            sampled = global_params[::max(1, step)][:sample_size]
-            # 添加首尾和中间部分确保覆盖
-            sampled = global_params[:1000] + global_params[len(global_params)//2:len(global_params)//2+1000] + global_params[-1000:]
-            s = str(sampled).encode('utf-8')
-        else:
-            # 小向量直接转换
-            s = str(global_params).encode('utf-8')
-        # 计算SHA-256哈希
-        h = hashlib.sha256(s).digest()
-        # 转换为整数
-        hash_int = int.from_bytes(h, byteorder='big', signed=False)
-        # print(f"[DO {self.id}] 全局参数哈希值(参数维度{len(global_params)}): {hash_int}")
-        return hash_int
+        return hash_global_params(global_params)
 
     def update_key(self, global_params: List[float]) -> None:
         """
@@ -984,7 +967,7 @@ class DO:
         print(f"[DO {self.id}] 开始本地训练，模型大小: {self.model_size}维，数据集 {dataset_name}，模型 {model_name}")
 
         # 使用全局参数哈希作为随机种子，确保每轮初始化与全局状态关联
-        seed_source = int(hashlib.sha256(str(global_params).encode('utf-8')).hexdigest(), 16)
+        seed_source = hash_global_params(global_params)
         model_seed = (seed_source + self.id) % (2 ** 32)
 
         use_persistent = self.model_name.startswith("resnet")

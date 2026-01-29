@@ -4,7 +4,7 @@ from sympy import nextprime
 
 class ImprovedPaillier:
     # ======================== 初始化 ======================== #
-    def __init__(self, m, bit_length=1024, precision=1_000_000):
+    def __init__(self, m, bit_length=2048, precision=1_000_000):
         """
         Improved Paillier 算法（支持整数和小数，纯Python实现）
         :param m: 数据拥有方数量
@@ -74,7 +74,7 @@ class ImprovedPaillier:
         """加密，自动支持小数"""
         # 先放大小数
         x_int = int(round(x * self.PRECISION))
-        r = secrets.randbits(self.bit_length // 2)
+        r = secrets.randbits(self.bit_length // 10)
         c = (pow(self.g, x_int, self.N2) * pow(self.h, r, self.N2) * SK_DO_i) % self.N2
         return c
 
@@ -85,13 +85,30 @@ class ImprovedPaillier:
             result = (result * c) % self.N2
         return result
 
+
+    # def decrypt(self, aggregated_data):
+    #     """解密，自动缩小小数到原始精度"""
+    #     L = (pow(aggregated_data, self.lambda_, self.N2) * self.u - 1) // self.N
+    #     x = L % self.N % self.y
+    #     if x > self.y // 2:
+    #         x = x - self.y
+    #     # 缩小到原始精度
+    #     return x / self.PRECISION
+
     def decrypt(self, aggregated_data):
-        """解密，自动缩小小数到原始精度"""
-        L = (pow(aggregated_data, self.lambda_, self.N2) * self.u - 1) // self.N
-        x = L % self.N % self.y
+        t = pow(aggregated_data, self.lambda_, self.N2)
+
+    # 自检 1：Paillier L 函数条件（必须成立）
+        if (t - 1) % self.N != 0:
+            print("[!!] L 条件失败: (c^λ - 1) mod N != 0")
+            print("    (t-1)%N =", (t - 1) % self.N)
+
+        L = (t - 1) // self.N          # 先做 L
+        m = (L * self.u) % self.N      # 再乘 u（这是标准公式）
+
+        x = m % self.y
         if x > self.y // 2:
-            x = x - self.y
-        # 缩小到原始精度
+            x -= self.y
         return x / self.PRECISION
 
 
